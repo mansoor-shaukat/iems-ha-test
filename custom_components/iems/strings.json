@@ -1,0 +1,21 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to iEMS",
+        "description": "Paste the API key from your iEMS portal (Account → Connect Home Assistant).",
+        "data": {
+          "api_key": "API key"
+        }
+      }
+    },
+    "error": {
+      "invalid_api_key": "API key format is invalid. It should start with iems_ and be copied exactly from the portal.",
+      "auth_failed": "Could not authenticate with iEMS. The key may be revoked or expired — generate a new one in the portal.",
+      "cannot_connect": "Could not reach iEMS cloud. Check your Home Assistant has internet access and try again."
+    },
+    "abort": {
+      "already_configured": "This iEMS account is already configured."
+    }
+  }
+}

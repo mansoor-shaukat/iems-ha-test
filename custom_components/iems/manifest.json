@@ -1,0 +1,18 @@
+{
+  "domain": "iems",
+  "name": "iEMS",
+  "version": "0.1.0",
+  "documentation": "https://github.com/mansoor-shaukat/iems-ha-test",
+  "issue_tracker": "https://github.com/mansoor-shaukat/iems-ha-test/issues",
+  "codeowners": ["@mansoor-shaukat"],
+  "config_flow": true,
+  "iot_class": "cloud_push",
+  "integration_type": "service",
+  "requirements": [
+    "jsonschema>=4.0,<5",
+    "aiohttp>=3.9,<4",
+    "boto3>=1.34,<2",
+    "awsiotsdk>=1.21,<2"
+  ],
+  "dependencies": []
+}
