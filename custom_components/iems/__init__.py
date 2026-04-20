@@ -138,12 +138,12 @@ if _HA_AVAILABLE:
         log.info("iems: indexed %d entities", len(entity_index))
 
         publisher = TelemetryPublisher(
-            user_id=creds.user_id,
+            user_id=creds.identity_id,
             publish_fn=adapter.publish,
         )
         coordinator = IemsCoordinator(
             hass=hass,
-            user_id=creds.user_id,
+            user_id=creds.identity_id,
             entity_index=entity_index,
             publisher=publisher,
         )

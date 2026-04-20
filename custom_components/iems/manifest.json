@@ -1,7 +1,7 @@
 {
   "domain": "iems",
   "name": "iEMS",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "documentation": "https://github.com/mansoor-shaukat/iems-ha-test",
   "issue_tracker": "https://github.com/mansoor-shaukat/iems-ha-test/issues",
   "codeowners": ["@mansoor-shaukat"],

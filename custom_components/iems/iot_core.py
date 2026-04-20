@@ -123,10 +123,10 @@ class IotCorePublisher:
     # ------------------------------------------------------------------
 
     async def _build_and_connect(self) -> None:
-        """Build MqttClientConnection from fresh credentials and connect."""
+        """Build MQTT connection from fresh credentials and connect."""
         try:
-            from awsiot import mqtt
-            from awscrt import auth as crt_auth, io as crt_io, mqtt as crt_mqtt
+            from awsiot import mqtt_connection_builder
+            from awscrt import auth as crt_auth, io as crt_io
         except ImportError as exc:
             raise RuntimeError(
                 "awsiotsdk / awscrt not installed. "
@@ -135,12 +135,6 @@ class IotCorePublisher:
 
         creds = await self._auth.get_credentials()
 
-        # awscrt credentials provider wrapping our temp STS creds
-        credentials = crt_auth.AwsCredentials(
-            access_key_id=creds.access_key_id,
-            secret_access_key=creds.secret_access_key,
-            session_token=creds.session_token,
-        )
         credentials_provider = crt_auth.AwsCredentialsProvider.new_static(
             access_key_id=creds.access_key_id,
             secret_access_key=creds.secret_access_key,
@@ -151,40 +145,18 @@ class IotCorePublisher:
         host_resolver = crt_io.DefaultHostResolver(event_loop_group)
         client_bootstrap = crt_io.ClientBootstrap(event_loop_group, host_resolver)
 
-        # SigV4 WebSocket signing function
-        def _signing_config():
-            return crt_auth.AwsSigningConfig(
-                algorithm=crt_auth.AwsSigningAlgorithm.V4_ASYMMETRIC
-                if hasattr(crt_auth.AwsSigningAlgorithm, "V4_ASYMMETRIC")
-                else crt_auth.AwsSigningAlgorithm.V4,
-                signature_type=crt_auth.AwsSignatureType.HTTP_REQUEST_QUERY_PARAMS,
-                credentials_provider=credentials_provider,
-                region=creds.region,
-                service="iotdevicegateway",
-            )
+        # ClientId MUST equal Cognito Identity ID (not User Pool sub) — IAM
+        # policy condition is `iot:ClientId == cognito-identity.amazonaws.com:sub`
+        # which resolves to the Identity Pool identity_id, not user_sub.
+        client_id = creds.identity_id
 
-        def _websocket_handshake_transform(transform_args, **kwargs):
-            crt_auth.aws_sign_request(
-                http_request=transform_args.http_request,
-                signing_config=_signing_config(),
-                on_complete=lambda signing_result, error_code, http_headers:
-                    transform_args.set_done(error_code),
-            )
-
-        mqtt_client = crt_mqtt.Client(
-            bootstrap=client_bootstrap,
-            tls_ctx=crt_io.ClientTlsContext(crt_io.TlsContextOptions()),
-        )
-
-        # ClientId MUST equal Cognito Identity sub — enforced by IAM policy
-        client_id = creds.user_id
-
-        connection = mqtt.MqttClientConnection(
-            client=mqtt_client,
-            host_name=creds.iot_endpoint,
-            port=443,
+        connection = mqtt_connection_builder.websockets_with_default_aws_signing(
+            endpoint=creds.iot_endpoint,
+            region=creds.region,
+            credentials_provider=credentials_provider,
+            client_bootstrap=client_bootstrap,
             client_id=client_id,
-            websocket_handshake_transform=_websocket_handshake_transform,
+            clean_session=True,
             keep_alive_secs=30,
         )
 
