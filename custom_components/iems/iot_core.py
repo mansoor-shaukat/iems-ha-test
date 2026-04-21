@@ -40,6 +40,9 @@ class IotCorePublisher:
         self._connection: Any | None = None  # awsiot.MqttClientConnection
         self._connected = False
         self._connect_lock = asyncio.Lock()
+        # Captured at connect() time; reused by awscrt threadpool callbacks
+        # to post state changes back to HA's asyncio loop via call_soon_threadsafe.
+        self._event_loop: asyncio.AbstractEventLoop | None = None
 
     # ------------------------------------------------------------------
     # Public interface
@@ -76,9 +79,11 @@ class IotCorePublisher:
     async def publish(self, *, topic: str, payload: dict, qos: int) -> bool:
         """Publish a JSON payload to the given topic.
 
-        Returns True on broker ACK. On ExpiredTokenException tears down
-        the connection and re-authenticates before raising so the caller
-        can retry.
+        Returns True on broker ACK. On connection-drop (network blip,
+        keep-alive miss, broker-side hangup) silently rebuilds the
+        connection with the same credentials before the attempt. On
+        ExpiredTokenException tears the connection down and
+        re-authenticates.
 
         Args:
             topic: Full MQTT topic string (must start with iems/{user_id}/).
@@ -86,14 +91,23 @@ class IotCorePublisher:
             qos:    0 (fire-and-forget) or 1 (at-least-once with ACK).
 
         Raises:
-            RuntimeError: if not connected.
-            asyncio.TimeoutError: if broker ACK times out.
+            RuntimeError: if publish fails for a non-recoverable reason.
+            asyncio.TimeoutError: if broker ACK times out after reconnect.
         """
+        # If the awscrt on_connection_interrupted callback flipped us to
+        # disconnected, transparently re-establish before publishing.
+        # This replaces the old "raise RuntimeError" path which dropped
+        # every batch between a drop and the next explicit connect() call.
         if not self._connected or self._connection is None:
-            raise RuntimeError(
-                "IotCorePublisher.publish called before connect(). "
-                "Call await adapter.connect() first."
-            )
+            log.info("iot_core: connection dropped, reconnecting before publish")
+            try:
+                await self.connect()
+            except Exception as exc:
+                # Can't get back online — surface to caller, coordinator
+                # will log + drop the batch and retry on the next tick.
+                raise RuntimeError(
+                    f"IotCorePublisher.publish: connect failed ({type(exc).__name__}: {exc})"
+                ) from exc
 
         payload_bytes = json.dumps(payload, separators=(",", ":")).encode()
 
@@ -150,6 +164,27 @@ class IotCorePublisher:
         # which resolves to the Identity Pool identity_id, not user_sub.
         client_id = creds.identity_id
 
+        # Capture the HA asyncio loop so awscrt threadpool callbacks can
+        # post state changes back via call_soon_threadsafe without racing.
+        self._event_loop = asyncio.get_event_loop()
+
+        def _on_interrupted(connection, error, **_kwargs) -> None:
+            """Called on awscrt thread when TCP/MQTT link drops."""
+            log.warning("iot_core: connection interrupted: %s", error)
+            loop = self._event_loop
+            if loop is not None and loop.is_running():
+                loop.call_soon_threadsafe(self._mark_disconnected)
+
+        def _on_resumed(connection, return_code, session_present, **_kwargs) -> None:
+            """Called on awscrt thread when awscrt auto-reconnects."""
+            log.info(
+                "iot_core: connection resumed rc=%s session_present=%s",
+                return_code, session_present,
+            )
+            loop = self._event_loop
+            if loop is not None and loop.is_running():
+                loop.call_soon_threadsafe(self._mark_connected)
+
         connection = mqtt_connection_builder.websockets_with_default_aws_signing(
             endpoint=creds.iot_endpoint,
             region=creds.region,
@@ -158,6 +193,8 @@ class IotCorePublisher:
             client_id=client_id,
             clean_session=True,
             keep_alive_secs=30,
+            on_connection_interrupted=_on_interrupted,
+            on_connection_resumed=_on_resumed,
         )
 
         loop = asyncio.get_event_loop()
@@ -190,6 +227,14 @@ class IotCorePublisher:
         await self._auth.close()
         async with self._connect_lock:
             await self._build_and_connect()
+
+    def _mark_disconnected(self) -> None:
+        """Flip internal state to disconnected. Called on HA loop only."""
+        self._connected = False
+
+    def _mark_connected(self) -> None:
+        """Flip internal state to connected. Called on HA loop only."""
+        self._connected = True
 
     @staticmethod
     def _qos_enum(qos: int):
