@@ -36,10 +36,13 @@ VALID_CATEGORIES: set[str] = {
     "other",
 }
 
-# Platforms we either own natively or are pure HA internals → hard suppress.
+# Platforms that are pure HA internals → hard suppress.
+# Previously included solarman/hue/sun/met under the assumption that iEMS had
+# direct bridges for those. Cloud architecture has NO direct bridges — HA is
+# the only source. v0.1.3 removed them for this reason; v0.1.5 bulk-sync
+# reintroduced them; v0.1.9 removes them again and locks the fix here AND in
+# public_repo_staging/.
 PLATFORM_BLACKLIST: set[str] = {
-    # we have better direct integrations
-    "solarman", "hue", "sun", "met",
     # HA plumbing / internals
     "hassio", "backup", "hacs", "homeassistant", "automation", "person",
     "mobile_app", "shopping_list", "google_translate",
