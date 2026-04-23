@@ -119,8 +119,8 @@ if _HA_AVAILABLE:
             raise ConfigEntryNotReady(f"iEMS cloud unreachable: {exc}") from exc
 
         log.info(
-            "iems: auth OK; user_id=%s... iot=%s region=%s",
-            creds.user_id[:8], creds.iot_endpoint, creds.region,
+            "iems: auth OK; identity_id=%s... user_sub=%s... iot=%s region=%s",
+            creds.identity_id[:16], creds.user_id[:8], creds.iot_endpoint, creds.region,
         )
 
         # Build the MQTT adapter once we have real credentials.
