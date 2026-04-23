@@ -36,12 +36,11 @@ VALID_CATEGORIES: set[str] = {
     "other",
 }
 
-# Platforms that are pure HA plumbing → hard suppress.
-# NOTE: local webserver's classifier also blacklists solarman/hue/sun/met
-# because the local server has direct bridges for them. HACS runs at the
-# customer's HA and has no direct path — HA is the only source — so those
-# stay in for cloud.
+# Platforms we either own natively or are pure HA internals → hard suppress.
 PLATFORM_BLACKLIST: set[str] = {
+    # we have better direct integrations
+    "solarman", "hue", "sun", "met",
+    # HA plumbing / internals
     "hassio", "backup", "hacs", "homeassistant", "automation", "person",
     "mobile_app", "shopping_list", "google_translate",
     "ibeacon", "cast", "apple_tv", "upnp",

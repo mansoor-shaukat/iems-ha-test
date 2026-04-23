@@ -3,9 +3,9 @@
     "step": {
       "user": {
         "title": "Connect to iEMS",
-        "description": "Paste the API key from your iEMS portal (Account → Connect Home Assistant). Format: iems_live_xxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "description": "Paste the API key from your iEMS portal (Account → Connect Home Assistant).",
         "data": {
-          "api_key": "API key (format: iems_live_…)"
+          "api_key": "API key"
         }
       }
     },

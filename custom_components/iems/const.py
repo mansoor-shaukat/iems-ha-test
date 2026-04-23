@@ -1,7 +1,7 @@
 """Constants for the iEMS HACS integration."""
 
 DOMAIN = "iems"
-VERSION = "0.1.0"
+VERSION = "0.1.6"
 
 # Config entry keys — stored in the HA config entry, never logged
 CONF_API_KEY = "api_key"
@@ -41,7 +41,7 @@ CREDENTIAL_REFRESH_LEAD_SECONDS = 300
 # /hacs-auth response, so we can shift regions without a client
 # update. Dev stage for Sprint 2; custom-domain cutover is a
 # separate Sprint 3 item.
-IEMS_AUTH_URL = "https://mnrwhhjnuf.execute-api.eu-central-1.amazonaws.com/hacs-auth"
+IEMS_AUTH_URL = "https://auth-dev.iems.io/hacs-auth"
 IEMS_AUTH_HTTP_TIMEOUT_SECONDS = 10
 
 # Rate-limit backoff — per spec §7 Q4: 400/401 are permanent fails

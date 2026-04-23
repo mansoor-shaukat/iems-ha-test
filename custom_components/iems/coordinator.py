@@ -7,6 +7,8 @@ Responsibilities:
   - Flush `pending` every BATCH_WINDOW_SECONDS by building a telemetry
     payload and handing it to the publisher.
   - Emit a heartbeat every HEARTBEAT_INTERVAL_SECONDS.
+  - For MTronic switch/plug entities: derive dispatch state (shed/import) and
+    immediately forward via dispatch_publisher (if wired).
 
 Pure of HA APIs for the capture/flush/heartbeat paths so unit tests
 only need a MagicMock hass. Real HA wiring lives in __init__.py.
@@ -20,9 +22,88 @@ from typing import Any
 
 from .classifier import classify
 from .const import BATCH_WINDOW_SECONDS, HEARTBEAT_INTERVAL_SECONDS
+from .mtronic_dispatch import DispatchCapture
 from .telemetry import EmptyBatchError, build_batch, build_heartbeat
 
+# Categories whose state must be a numeric float for TS# writes to succeed.
+# HA always returns new_state.state as a str; we coerce here at the HACS boundary
+# so the ingestion Lambda sees the correct type and writes TS# minute-bucket rows.
+_NUMERIC_CATEGORIES: frozenset[str] = frozenset({
+    "inverter.pv",
+    "inverter.battery",
+    "inverter.grid",
+    "inverter.load",
+    "battery.soc",
+    "sensor.power",
+    "sensor.energy",
+    "meter.energy",
+})
+
+# The synthetic site-level PV aggregate entity published per-batch so that
+# TS#sensor.site_pv_power gets live minute-bucket rows (not just backfill).
+_SITE_PV_ENTITY_ID = "sensor.site_pv_power"
+
 log = logging.getLogger("iems.coordinator")
+
+
+def _coerce_state(raw: str, category: str) -> float | str:
+    """Coerce HA state string to float for numeric categories.
+
+    HA's state machine stores all state values as strings.  For numeric
+    energy/power categories the ingestion Lambda's _upsert_ts_bucket guard
+    requires isinstance(state, (int, float)).  We coerce here at the HACS
+    boundary so the contract is satisfied before the payload leaves the device.
+
+    Returns the original string unchanged for non-numeric categories or when
+    parsing fails (e.g. 'unavailable', 'unknown').
+    """
+    if category not in _NUMERIC_CATEGORIES:
+        return raw
+    try:
+        return float(raw)
+    except (ValueError, TypeError):
+        return raw
+
+
+def _build_site_pv_entity(pv_entities: list[dict]) -> dict | None:
+    """Synthesize a site-level PV aggregate entity from per-inverter PV entities.
+
+    Sums all numeric inverter.pv state values in the current batch and returns
+    a synthetic entity for sensor.site_pv_power.  This gives the ingestion
+    Lambda a live numeric value to write into TS#sensor.site_pv_power so the
+    Power History chart has live data (not just backfill/system_totals rows).
+
+    Returns None if no numeric inverter.pv values exist in the batch.
+    """
+    total: float = 0.0
+    latest_ts: str | None = None
+    unit: str | None = None
+    has_numeric = False
+
+    for e in pv_entities:
+        state = e.get("state")
+        if isinstance(state, (int, float)) and not isinstance(state, bool):
+            total += float(state)
+            has_numeric = True
+        # Keep the most recent timestamp as the aggregate timestamp
+        ts = e.get("ts")
+        if ts is not None and (latest_ts is None or ts > latest_ts):
+            latest_ts = ts
+        if unit is None and e.get("unit"):
+            unit = e["unit"]
+
+    if not has_numeric or latest_ts is None:
+        return None
+
+    entity: dict[str, Any] = {
+        "entity_id": _SITE_PV_ENTITY_ID,
+        "category": "inverter.pv",
+        "ts": latest_ts,
+        "state": total,
+    }
+    if unit:
+        entity["unit"] = unit
+    return entity
 
 
 class IemsCoordinator:
@@ -33,11 +114,15 @@ class IemsCoordinator:
         user_id: str,
         entity_index: dict[str, dict[str, Any]],
         publisher,
+        dispatch_publisher=None,
+        direct_entity_ids: frozenset[str] | None = None,
     ) -> None:
         self._hass = hass
         self._user_id = user_id
         self._entity_index = entity_index
         self._publisher = publisher
+        self._dispatch_publisher = dispatch_publisher
+        self._dispatch_capture = DispatchCapture(direct_entity_ids=direct_entity_ids)
         self.pending: list[dict] = []
         self._unsub_state = None
         self._batch_task: asyncio.Task | None = None
@@ -47,13 +132,51 @@ class IemsCoordinator:
     # ---------------------- State capture ---------------------------------
 
     def capture_state_change(self, new_state) -> None:
-        """Sync handler — called from HA's event bus callback. No I/O."""
+        """Sync handler — called from HA's event bus callback. No I/O.
+
+        For MTronic switch entities, also schedules a dispatch event publish
+        (fire-and-forget coroutine on the asyncio loop).
+        """
         if new_state is None:
             return
         entity_id = new_state.entity_id
         meta = self._entity_index.get(entity_id)
         if not meta:
             return  # not in our registry snapshot → drop
+
+        ts = self._extract_ts(new_state)
+        attrs = dict(getattr(new_state, "attributes", {}) or {})
+
+        # MTronic dispatch capture — runs before classifier so suppressed
+        # telemetry entities (domain blacklist) can still emit dispatch events.
+        if self._dispatch_publisher is not None:
+            dispatch_event = self._dispatch_capture.process_state_change(
+                entity_id=entity_id,
+                platform=meta.get("platform"),
+                domain=meta.get("domain") or entity_id.split(".", 1)[0],
+                new_state=new_state.state,
+                attrs=attrs,
+                ts=ts,
+                area=meta.get("area"),
+            )
+            if dispatch_event is not None and dispatch_event.suppressed_by is None:
+                # Schedule async publish without blocking the event loop callback.
+                # In production HA, hass.async_create_task is the canonical way
+                # to schedule a coroutine from a sync callback on the HA loop.
+                # We fall back to asyncio.get_running_loop().create_task() for
+                # test environments where hass is a MagicMock.
+                coro = self._dispatch_publisher.publish_dispatch(dispatch_event)
+                create_task = getattr(self._hass, "async_create_task", None)
+                if callable(create_task):
+                    create_task(coro)
+                else:
+                    try:
+                        loop = asyncio.get_running_loop()
+                        loop.create_task(coro)
+                    except RuntimeError:
+                        # No event loop running (unit test without asyncio context).
+                        # Store coroutine so tests can await it directly.
+                        coro.close()  # avoid "coroutine never awaited" warning
 
         classified = classify({
             "entity_id": entity_id,
@@ -66,13 +189,11 @@ class IemsCoordinator:
         if not classified.get("surface"):
             return
 
-        ts = self._extract_ts(new_state)
-
         captured: dict[str, Any] = {
             "entity_id": entity_id,
             "category": classified["category"],
             "ts": ts,
-            "state": new_state.state,
+            "state": _coerce_state(new_state.state, classified["category"]),
         }
         if meta.get("brand"):
             captured["brand"] = meta["brand"]
@@ -80,9 +201,8 @@ class IemsCoordinator:
             captured["area"] = meta["area"]
         if meta.get("unit"):
             captured["unit"] = meta["unit"]
-        attrs = getattr(new_state, "attributes", None)
         if attrs:
-            captured["attributes"] = dict(attrs)
+            captured["attributes"] = attrs
 
         self.pending.append(captured)
 
@@ -106,11 +226,36 @@ class IemsCoordinator:
 
         The publisher owns retry (via its bounded queue). We always clear
         `pending` after handing off, so we never double-ship a batch.
+
+        Site-PV aggregate: if any inverter.pv entities are present we inject a
+        synthetic sensor.site_pv_power entity so ingestion writes a live TS#
+        minute-bucket row for the Power History chart.  Per-inverter PV rows
+        continue to land in LATEST# (unchanged), but only the site-aggregate
+        has a TS# row — matching the backfill pattern and Sarah's guidance.
         """
         if not self.pending:
             return
         batch = self.pending[:]
         self.pending.clear()
+
+        # Synthesize site-level PV aggregate from per-inverter PV entities.
+        pv_entities = [e for e in batch if e.get("category") == "inverter.pv"]
+        if pv_entities:
+            site_pv = _build_site_pv_entity(pv_entities)
+            if site_pv is not None:
+                # Only inject if no entity already covers site_pv_power (guard
+                # against double-injection if an inverter integration happens to
+                # publish a site-level aggregate entity directly).
+                existing_ids = {e["entity_id"] for e in batch}
+                if _SITE_PV_ENTITY_ID not in existing_ids:
+                    batch.append(site_pv)
+                    log.debug(
+                        "flush: injected %s state=%.1f W (%d inverter.pv sources)",
+                        _SITE_PV_ENTITY_ID,
+                        site_pv["state"],
+                        len(pv_entities),
+                    )
+
         try:
             ha_version = getattr(self._hass.config, "version", "unknown")
             payload = build_batch(
