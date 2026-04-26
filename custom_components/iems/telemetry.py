@@ -59,6 +59,8 @@ def build_batch(
     entities: Iterable[dict],
     ha_version: str,
     instance_id: str | None = None,
+    country: str | None = None,
+    timezone: str | None = None,
 ) -> dict:
     """Build a `telemetry.schema.json`-conforming payload.
 
@@ -73,6 +75,12 @@ def build_batch(
         Home Assistant core version string.
     instance_id
         HA instance UUID (optional; multi-install debugging).
+    country
+        ISO 3166-1 alpha-2 country code from HA core.config.country.
+        Optional (v0.5.0); omitted from payload when None or empty.
+    timezone
+        HA core.config.time_zone string (e.g. 'Asia/Karachi').
+        Optional (v0.5.0); omitted from payload when None or empty.
 
     Raises
     ------
@@ -116,6 +124,11 @@ def build_batch(
     }
     if instance_id:
         source["instance_id"] = instance_id
+    # v0.5.0 optional fields — only emit when HA has them configured.
+    if country:
+        source["country"] = country
+    if timezone:
+        source["timezone"] = timezone
 
     return {
         "schema_version": SCHEMA_VERSION,

@@ -22,6 +22,7 @@ from typing import Any
 
 from .classifier import classify
 from .const import BATCH_WINDOW_SECONDS, HEARTBEAT_INTERVAL_SECONDS
+from .dedup import canonicalize_entity_id
 from .mtronic_dispatch import DispatchCapture
 from .telemetry import EmptyBatchError, build_batch, build_heartbeat
 
@@ -65,22 +66,93 @@ def _coerce_state(raw: str, category: str) -> float | str:
         return raw
 
 
+def _reduce_pv_entities_for_sum(pv_entities: list[dict]) -> list[dict]:
+    """Deduplicate pv_entities before summing for the site-PV aggregate (FIX B).
+
+    RCA 2026-04-24 (docs/sprints/sprint_03/hacs_0.1.9_classifier_delta.md):
+    the unreduced sum of inverter.pv entries in a 30s batch can reach 85 kW on
+    a 15.4 kWp system because:
+
+    1. Each state_changed event is appended to pending independently — a single
+       entity firing 4 times in a window contributes 4x its value to the sum.
+    2. Per-MPPT-string entities (*_pv1_power, *_pv2_power) are summed alongside
+       their parent aggregate (*_pv_power) — triple-counting a multi-MPPT
+       inverter's generation.
+
+    This function applies two reductions:
+
+    PASS 1 — collapse repeated firings of the same entity_id to a single
+             survivor (the entry with the highest ts in the window).
+
+    PASS 2 — for each canonical entity_id (computed via
+             dedup.canonicalize_entity_id which maps `*_pv1_*` → `*_pv_*`),
+             if the aggregate `*_pv_power` entry is present, drop the numbered
+             per-string variants.  If only per-string variants exist (no
+             aggregate), keep them all so the fallback sum is correct.
+    """
+    if not pv_entities:
+        return []
+
+    # PASS 1: keep only the latest entry per entity_id (highest ts wins;
+    # stable fallback for missing ts).
+    latest_per_eid: dict[str, dict] = {}
+    for e in pv_entities:
+        eid = e.get("entity_id")
+        if not eid:
+            continue
+        prev = latest_per_eid.get(eid)
+        if prev is None:
+            latest_per_eid[eid] = e
+            continue
+        prev_ts = prev.get("ts") or ""
+        cur_ts = e.get("ts") or ""
+        if cur_ts > prev_ts:
+            latest_per_eid[eid] = e
+
+    # PASS 2: for each canonical group, if the aggregate entity_id
+    # (== canonical) is present, drop the per-string variants.
+    by_canonical: dict[str, list[dict]] = {}
+    for eid, e in latest_per_eid.items():
+        canonical = canonicalize_entity_id(eid)
+        by_canonical.setdefault(canonical, []).append(e)
+
+    reduced: list[dict] = []
+    for canonical, group in by_canonical.items():
+        # Aggregate present? Prefer it and drop the per-string siblings.
+        aggregate = next(
+            (e for e in group if e.get("entity_id") == canonical),
+            None,
+        )
+        if aggregate is not None:
+            reduced.append(aggregate)
+        else:
+            # No aggregate — fall back to summing the per-string entries.
+            reduced.extend(group)
+    return reduced
+
+
 def _build_site_pv_entity(pv_entities: list[dict]) -> dict | None:
     """Synthesize a site-level PV aggregate entity from per-inverter PV entities.
 
-    Sums all numeric inverter.pv state values in the current batch and returns
+    Sums numeric inverter.pv state values in the current batch and returns
     a synthetic entity for sensor.site_pv_power.  This gives the ingestion
     Lambda a live numeric value to write into TS#sensor.site_pv_power so the
     Power History chart has live data (not just backfill/system_totals rows).
 
+    Per FIX B (RCA 2026-04-24) the input list is first reduced by
+    `_reduce_pv_entities_for_sum` to kill the repeated-firing and aggregate+
+    sub-channel double-counts.
+
     Returns None if no numeric inverter.pv values exist in the batch.
     """
+    reduced = _reduce_pv_entities_for_sum(pv_entities)
+
     total: float = 0.0
     latest_ts: str | None = None
     unit: str | None = None
     has_numeric = False
 
-    for e in pv_entities:
+    for e in reduced:
         state = e.get("state")
         if isinstance(state, (int, float)) and not isinstance(state, bool):
             total += float(state)
@@ -258,10 +330,16 @@ class IemsCoordinator:
 
         try:
             ha_version = getattr(self._hass.config, "version", "unknown")
+            # v0.5.0: emit country/timezone when HA has them configured.
+            country = getattr(self._hass.config, "country", None) or None
+            timezone = getattr(self._hass.config, "time_zone", None)
+            timezone = str(timezone) if timezone else None
             payload = build_batch(
                 user_id=self._user_id,
                 entities=batch,
                 ha_version=ha_version,
+                country=country,
+                timezone=timezone,
             )
         except EmptyBatchError:
             return

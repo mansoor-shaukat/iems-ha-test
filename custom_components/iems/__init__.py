@@ -56,11 +56,43 @@ from .coordinator import IemsCoordinator
 from .publisher import TelemetryPublisher
 
 
+def _consumer_device_ids(er_reg, entities) -> frozenset:
+    """Return the set of device_ids that have a colocated consumer binary sensor.
+
+    A device is considered a consumer device (Ring doorbell, Aqara motion/smoke
+    sensor, etc.) when it has at least one binary_sensor entity whose entity_id
+    or device_class contains a consumer-safety keyword (motion, smoke, door,
+    occupancy, window, tamper, vibration, moisture).  We never suppress energy
+    storage (Deye, Pylontech) this way because those devices don't have
+    colocated consumer safety sensors.
+
+    N4 (2026-04-25): prevents Ring/Aqara device-battery entities from
+    appearing as battery.soc in the cloud telemetry.
+    """
+    _CONSUMER_KEYWORDS = frozenset(
+        {"motion", "smoke", "door", "occupancy", "window", "tamper", "vibration", "moisture"}
+    )
+
+    consumer_ids: set[str] = set()
+    for ent in entities:
+        if ent.domain != "binary_sensor" or not ent.device_id:
+            continue
+        dc = (ent.device_class or ent.original_device_class or "").lower()
+        eid_lower = ent.entity_id.lower()
+        if dc in _CONSUMER_KEYWORDS or any(kw in eid_lower for kw in _CONSUMER_KEYWORDS):
+            consumer_ids.add(ent.device_id)
+    return frozenset(consumer_ids)
+
+
 def _build_entity_index(hass) -> dict[str, dict[str, Any]]:
     """Snapshot HA registries into a flat dict consulted on every event."""
     er_reg = er.async_get(hass)
     dr_reg = dr.async_get(hass)
     ar_reg = ar.async_get(hass)
+
+    # N4: pre-compute the set of device_ids that carry consumer safety sensors
+    # so we can mark their battery entities as consumer_device=True.
+    consumer_dev_ids = _consumer_device_ids(er_reg, er_reg.entities.values())
 
     index: dict[str, dict[str, Any]] = {}
     for ent in er_reg.entities.values():
@@ -77,6 +109,7 @@ def _build_entity_index(hass) -> dict[str, dict[str, Any]]:
             "name": ent.name or ent.original_name or ent.entity_id,
             "area": area.name if area else None,
             "brand": brand,
+            "consumer_device": bool(ent.device_id and ent.device_id in consumer_dev_ids),
         }
     return index
 

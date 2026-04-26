@@ -81,11 +81,22 @@ CONTROLLABLE_DOMAIN_MAP: dict[str, str] = {
 
 # Name-keyword → inverter category. `battery` here means "inverter battery
 # power channel"; SOC is resolved first.
+# N5 (2026-04-25): Enphase Envoy keywords added. Enphase reports generation
+# via `production`/`generation` (PV side) and household draw via `consumption`
+# (load side). `envoy` is the Enphase hub entity name prefix — maps to PV-side
+# as fallback, but `consumption` is checked first so a combined entity_id like
+# `sensor.envoy_xxx_current_power_consumption` correctly routes to inverter.load.
+# Evaluation order matters: more-specific keywords (load-side: consumption, load)
+# are checked before the hub-name fallback (envoy).
 INVERTER_KEYWORDS: dict[str, str] = {
     "pv": "inverter.pv",
     "solar": "inverter.pv",
+    "production": "inverter.pv",
+    "generation": "inverter.pv",
     "grid": "inverter.grid",
+    "consumption": "inverter.load",
     "load": "inverter.load",
+    "envoy": "inverter.pv",
     "battery": "inverter.battery",
 }
 
@@ -134,7 +145,16 @@ def classify(entity: dict) -> dict:
     name_has_soc = any(k in name for k in SOC_NAME_HINTS)
 
     # 2. Battery SOC — evaluated BEFORE inverter.battery name-hint.
+    #    N4 (2026-04-25): consumer-device filter. If the entity's device has a
+    #    colocated motion/smoke/door binary sensor the battery belongs to a
+    #    consumer device (Ring doorbell, Aqara sensor, smoke detector) — NOT
+    #    energy storage. Suppress it from battery.soc and route to other.
+    #    The `consumer_device` flag is set by _build_entity_index in __init__.py.
     if dc == "battery" or name_has_soc:
+        if entity.get("consumer_device"):
+            entity["surface"] = True
+            entity["category"] = "other"
+            return entity
         entity["surface"] = True
         entity["category"] = "battery.soc"
         return entity

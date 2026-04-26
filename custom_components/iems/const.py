@@ -1,7 +1,7 @@
 """Constants for the iEMS HACS integration."""
 
 DOMAIN = "iems"
-VERSION = "0.1.9"
+VERSION = "0.1.11"
 
 # Config entry keys — stored in the HA config entry, never logged
 CONF_API_KEY = "api_key"
@@ -56,5 +56,5 @@ TELEMETRY_TOPIC_TEMPLATE = "iems/{user_id}/telemetry"
 HEARTBEAT_TOPIC_TEMPLATE = "iems/{user_id}/heartbeat"
 
 # Schema — MUST match server-side ingestion validator version
-SCHEMA_VERSION = "0.1.0"
+SCHEMA_VERSION = "0.5.0"
 MAX_ENTITIES_PER_BATCH = 500
