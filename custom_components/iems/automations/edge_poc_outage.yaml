@@ -1,0 +1,66 @@
+# Edge PoC — Outage signal → light.living_lamp amber
+# Sprint 5 Track B. Single-site PoC. Mansoor's home.
+#
+# Trigger: numeric_state below 50V on any of the 4 canonical voltage entities,
+# held for 60s (for: 60s). On each trigger, calls iems.edge_poc_outage_voltage_change
+# which runs the AND-of-all check server-side (_grid_is_down). Only fires amber
+# when ALL four inverters are below threshold — single-inverter polling glitches
+# don't satisfy the AND condition.
+#
+# Canonical entity reference: docs/architecture/canonical_signals.md §Grid availability.
+# DO NOT revert to binary_sensor.inverter[12]_grid — those gave 3 false positives
+# in 14 days from single-inverter Modbus polling glitches while voltage held steady.
+#
+# Load into HA by adding to configuration.yaml:
+#   automation: !include_dir_merge_list custom_components/iems/automations/
+#
+# Or manually copy these automation definitions into your automations.yaml.
+#
+# See: docs/integrations/edge_poc_outage_amber.md for full spec.
+
+# ── Automation 1: Any voltage drops below 50V → run AND check ─────────────
+- id: iems_edge_poc_voltage_change
+  alias: "iEMS PoC — Voltage drop → AND check → amber if all down"
+  description: >
+    When any inverter grid_l1_voltage sensor reports below 50V for ≥60s,
+    call iems.edge_poc_outage_voltage_change. The Python handler runs the
+    AND-of-all-four check (_grid_is_down): amber only fires if ALL four
+    inverters are simultaneously NULL or < 50V. The 60s for: duration here
+    is the grid-off debounce at the YAML layer (matches GRID_OFF_DEBOUNCE_S).
+  mode: single
+  max_exceeded: silent
+  trigger:
+    - platform: numeric_state
+      entity_id:
+        - sensor.inverter1_grid_l1_voltage
+        - sensor.inverter2_grid_l1_voltage
+        - sensor.ground_master_grid_l1_voltage_2
+        - sensor.ground_slave_grid_l1_voltage
+      below: 50
+      for:
+        seconds: 60
+  action:
+    - service: iems.edge_poc_outage_voltage_change
+
+# ── Automation 2: Voltage recovers above 50V → run AND check ──────────────
+- id: iems_edge_poc_voltage_recovered
+  alias: "iEMS PoC — Voltage restored → AND check → restore lamp if all up"
+  description: >
+    When any inverter grid_l1_voltage sensor reports ≥ 50V and stays there for ≥60s,
+    call iems.edge_poc_outage_voltage_change. The Python handler re-checks all four
+    sensors; restore only fires if all four are ≥ 50V. The 60s for: is the grid-on
+    debounce (matches GRID_ON_DEBOUNCE_S).
+  mode: single
+  max_exceeded: silent
+  trigger:
+    - platform: numeric_state
+      entity_id:
+        - sensor.inverter1_grid_l1_voltage
+        - sensor.inverter2_grid_l1_voltage
+        - sensor.ground_master_grid_l1_voltage_2
+        - sensor.ground_slave_grid_l1_voltage
+      above: 49
+      for:
+        seconds: 60
+  action:
+    - service: iems.edge_poc_outage_voltage_change

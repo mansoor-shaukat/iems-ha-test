@@ -9,7 +9,10 @@ async_setup_entry responsibilities:
   5. Build entity_index from HA's registries.
   6. Construct IemsCoordinator, subscribe to state_changed, start
      batch + heartbeat timers.
-  7. Stash adapter/coordinator/publisher in hass.data for unload.
+  7. Wire EdgePocOutageHandler (Sprint 5 Track B) — grid-off → amber,
+     grid-on → restore. Local-only, zero cloud round-trip.
+  8. Stash adapter/coordinator/publisher/edge_poc_handler in hass.data
+     for unload.
 
 The auth provider is the ONLY entry point to cloud endpoint routing —
 there are no `IOT_ENDPOINT` / `IOT_PORT` / `DEV_USER_ID` hardcodes
@@ -53,6 +56,7 @@ except ImportError:  # pragma: no cover - dev env
     _HA_AVAILABLE = False
 
 from .coordinator import IemsCoordinator
+from .edge_poc_outage import EdgePocOutageHandler, register_services, resolve_db_path
 from .publisher import TelemetryPublisher
 
 
@@ -194,11 +198,21 @@ if _HA_AVAILABLE:
 
         await coordinator.start()
 
+        # Sprint 5 Track B — Edge PoC: outage signal → light.living_lamp amber.
+        # Local-only (no cloud round-trip). Single-site PoC (Mansoor's home).
+        # See: docs/integrations/edge_poc_outage_amber.md
+        db_path = resolve_db_path(hass)
+        edge_poc = EdgePocOutageHandler(hass=hass, db_path=db_path)
+        register_services(hass, edge_poc)
+        await edge_poc.async_start()
+        log.info("iems: edge-poc outage handler started; db=%s", db_path)
+
         hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
             "coordinator": coordinator,
             "adapter": adapter,
             "publisher": publisher,
             "auth": auth,
+            "edge_poc": edge_poc,
         }
         return True
 
@@ -209,6 +223,9 @@ if _HA_AVAILABLE:
         coord = record.get("coordinator")
         adapter = record.get("adapter")
         auth = record.get("auth")
+        edge_poc = record.get("edge_poc")
+        if edge_poc:
+            edge_poc.stop()
         if coord:
             await coord.stop()
         if adapter:

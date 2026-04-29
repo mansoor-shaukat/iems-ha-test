@@ -1,7 +1,7 @@
 """Constants for the iEMS HACS integration."""
 
 DOMAIN = "iems"
-VERSION = "0.1.11"
+VERSION = "0.1.12"
 
 # Config entry keys — stored in the HA config entry, never logged
 CONF_API_KEY = "api_key"
