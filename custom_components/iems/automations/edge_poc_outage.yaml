@@ -1,11 +1,14 @@
-# Edge PoC — Outage signal → light.living_lamp amber
+# Edge PoC — Outage signal → light.living_lamp blue
 # Sprint 5 Track B. Single-site PoC. Mansoor's home.
+#
+# CEO directive 2026-05-01: outage lamp color is BLUE (was amber Day 1-4).
+# xy = [0.1532, 0.0475] (Hue Gamut C blue corner), brightness = 200.
 #
 # Trigger: numeric_state below 50V on any of the 4 canonical voltage entities,
 # held for 60s (for: 60s). On each trigger, calls iems.edge_poc_outage_voltage_change
-# which runs the AND-of-all check server-side (_grid_is_down). Only fires amber
-# when ALL four inverters are below threshold — single-inverter polling glitches
-# don't satisfy the AND condition.
+# which runs the AND-of-all check server-side (_grid_is_down). Only fires the
+# blue outage signal when ALL four inverters are below threshold — single-inverter
+# polling glitches don't satisfy the AND condition.
 #
 # Canonical entity reference: docs/architecture/canonical_signals.md §Grid availability.
 # DO NOT revert to binary_sensor.inverter[12]_grid — those gave 3 false positives
@@ -16,17 +19,18 @@
 #
 # Or manually copy these automation definitions into your automations.yaml.
 #
-# See: docs/integrations/edge_poc_outage_amber.md for full spec.
+# See: docs/integrations/edge_poc_outage_color.md for full spec.
 
 # ── Automation 1: Any voltage drops below 50V → run AND check ─────────────
 - id: iems_edge_poc_voltage_change
-  alias: "iEMS PoC — Voltage drop → AND check → amber if all down"
+  alias: "iEMS PoC — Voltage drop → AND check → blue if all down"
   description: >
     When any inverter grid_l1_voltage sensor reports below 50V for ≥60s,
     call iems.edge_poc_outage_voltage_change. The Python handler runs the
-    AND-of-all-four check (_grid_is_down): amber only fires if ALL four
-    inverters are simultaneously NULL or < 50V. The 60s for: duration here
-    is the grid-off debounce at the YAML layer (matches GRID_OFF_DEBOUNCE_S).
+    AND-of-all-four check (_grid_is_down): the outage color (blue) only
+    fires if ALL four inverters are simultaneously NULL or < 50V. The 60s
+    for: duration here is the grid-off debounce at the YAML layer (matches
+    GRID_OFF_DEBOUNCE_S).
   mode: single
   max_exceeded: silent
   trigger:

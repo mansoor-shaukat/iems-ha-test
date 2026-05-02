@@ -9,8 +9,9 @@ async_setup_entry responsibilities:
   5. Build entity_index from HA's registries.
   6. Construct IemsCoordinator, subscribe to state_changed, start
      batch + heartbeat timers.
-  7. Wire EdgePocOutageHandler (Sprint 5 Track B) — grid-off → amber,
-     grid-on → restore. Local-only, zero cloud round-trip.
+  7. Wire EdgePocOutageHandler (Sprint 5 Track B) — grid-off → outage color
+     (blue per CEO directive 2026-05-01), grid-on → restore. Local-only,
+     zero cloud round-trip.
   8. Stash adapter/coordinator/publisher/edge_poc_handler in hass.data
      for unload.
 
@@ -198,9 +199,10 @@ if _HA_AVAILABLE:
 
         await coordinator.start()
 
-        # Sprint 5 Track B — Edge PoC: outage signal → light.living_lamp amber.
+        # Sprint 5 Track B — Edge PoC: outage signal → light.living_lamp blue.
+        # CEO directive 2026-05-01: blue (was amber Day 1-4).
         # Local-only (no cloud round-trip). Single-site PoC (Mansoor's home).
-        # See: docs/integrations/edge_poc_outage_amber.md
+        # See: docs/integrations/edge_poc_outage_color.md
         db_path = resolve_db_path(hass)
         edge_poc = EdgePocOutageHandler(hass=hass, db_path=db_path)
         register_services(hass, edge_poc)

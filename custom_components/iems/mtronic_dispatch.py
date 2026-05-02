@@ -15,7 +15,9 @@ Power reading:
   - Per protocol docs: shadow 'p' field retains stale value after switch-OFF;
     we zero it out ourselves when state is 'off'.
 
-Dedup invariant (memory/feedback_ha_dedup_mandatory.md):
+Dedup invariant (dormant since 2026-04-16 HA-only cutover, Phase 4.10 commit
+4e9f3d9 — direct integrations are disabled, so direct_entity_ids is always
+empty in current production. See memory/feedback_direct_integrations_disabled.md):
   - Before emitting, check whether the device_id appears in the caller-supplied
     direct_entity_ids set. If yes, suppress — the direct integration owns it.
 

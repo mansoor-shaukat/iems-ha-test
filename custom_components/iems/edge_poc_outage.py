@@ -1,4 +1,4 @@
-"""Edge PoC — outage-signal → light.living_lamp amber.
+"""Edge PoC — outage-signal → light.living_lamp blue (outage signal).
 
 Sprint 5 Track B. Single-site PoC (Mansoor's home). Zero cloud round-trip.
 
@@ -11,16 +11,22 @@ See: docs/architecture/canonical_signals.md §Grid availability.
 
 When grid loss is confirmed (4-of-4 NULL/<50V, ≥60s sustained):
   1. Capture current lamp state to HA Storage (survives HA restart).
-  2. Apply amber (xy_color [0.564, 0.426], brightness 180) within ≤2s.
+  2. Apply blue (xy_color [0.1532, 0.0475], brightness 200) within ≤2s.
   3. When ALL 4 voltages ≥ 50V for ≥60s, restore prior lamp state.
   4. Log fire/restore events + latency to local SQLite.
+
+Color directive (CEO 2026-05-01): outage lamp is BLUE — not amber, not crimson.
+xy_color [0.1532, 0.0475] is the Philips Hue published Gamut C blue corner
+(highest-saturation deep blue physically realisable on Hue color lamps).
+Bilal verifies against the lamp's reported gamut on first deploy.
 
 Detection helper: _grid_is_down(states)
   Returns True  iff EVERY listed inverter's voltage is missing/None or < 50V.
   Returns False if ANY voltage is ≥ 50V.
-  Returns False (inconclusive, fail-safe "grid up") when < 3 inverters have
-             reported within the last 60s — avoids false fires from Solarman
-             partial-gap scenarios.
+  Returns False (inconclusive, fail-safe "grid up") when < 4 inverters have
+             reported within the last 60s — the canonical AND-of-all rule
+             requires ALL FOUR fresh; if any one is stale we cannot confirm.
+             CEO directive 2026-05-01 (tightened from < 3).
 
 Phasing: CEO-scoped single-site PoC. NOT a commercial CONTROL ship.
 Sprint 7 CONTROL gate does not apply. No rollout until:
@@ -28,7 +34,7 @@ Sprint 7 CONTROL gate does not apply. No rollout until:
   (b) VISUAL_INDICATOR sub-class taxonomised by Ilya v0.2.0
   (c) User-data implications reviewed (onboarding_privacy_gdpr.md)
 
-See: docs/integrations/edge_poc_outage_amber.md for full spec.
+See: docs/integrations/edge_poc_outage_color.md for full spec.
 """
 from __future__ import annotations
 
@@ -64,13 +70,19 @@ VOLTAGE_ENTITY_IDS: tuple[str, ...] = (
 GRID_DOWN_VOLTAGE_THRESHOLD: float = 50.0
 
 # Minimum number of inverters that must have reported within STALE_WINDOW_S
-# seconds for the check to be considered conclusive.
-MIN_REPORTING_INVERTERS: int = 3
+# seconds for the check to be considered conclusive. The canonical AND-of-all
+# rule requires ALL FOUR fresh; CEO directive 2026-05-01 tightened from 3 to 4.
+MIN_REPORTING_INVERTERS: int = 4
 STALE_WINDOW_S: float = 60.0
 
-# Amber CIE 1931 xy — ≈ #FFB000 / ~2200K
-AMBER_XY: tuple[float, float] = (0.564, 0.426)
-AMBER_BRIGHTNESS: int = 180
+# Outage CIE 1931 xy — Philips Hue Gamut C blue corner (deep, high-saturation).
+# CEO directive 2026-05-01: BLUE replaces the prior amber (0.564, 0.426).
+# Source: Philips Hue published Gamut C — deep blue corner ≈ (0.1532, 0.0475).
+# Brightness raised 180 → 200 because deep-blue is perceptually dimmer than
+# amber at the same brightness; 200 keeps the visual signal strength comparable
+# without being painful at night.
+OUTAGE_XY: tuple[float, float] = (0.1532, 0.0475)
+OUTAGE_BRIGHTNESS: int = 200
 
 # Debounce windows (seconds) — 60s/60s per CEO directive 2026-04-29.
 # Analysis: all 3 confirmed false positives lasted 37–38s; real outages start
@@ -256,14 +268,16 @@ async def capture_lamp_state(hass, entity_id: str) -> dict[str, Any]:
     return captured
 
 
-async def apply_amber(hass, entity_id: str, prior_state: dict[str, Any]) -> None:
-    """Turn lamp to amber (xy_color [0.564, 0.426], brightness 180).
+async def apply_outage_color(hass, entity_id: str, prior_state: dict[str, Any]) -> None:
+    """Turn lamp to the outage color (blue: xy_color [0.1532, 0.0475], brightness 200).
+
+    CEO directive 2026-05-01: outage signal is BLUE (was amber Day 1-4).
 
     prior_state is expected to already be persisted by capture_lamp_state.
     This call does NOT re-persist — it only issues the service call.
     """
     log.info(
-        "edge_poc: applying amber to %s (prior state=%s brightness=%s)",
+        "edge_poc: applying outage color (blue) to %s (prior state=%s brightness=%s)",
         entity_id, prior_state.get("state"), prior_state.get("brightness"),
     )
     await hass.services.async_call(
@@ -271,8 +285,8 @@ async def apply_amber(hass, entity_id: str, prior_state: dict[str, Any]) -> None
         "turn_on",
         {
             "entity_id": entity_id,
-            "xy_color": list(AMBER_XY),
-            "brightness": AMBER_BRIGHTNESS,
+            "xy_color": list(OUTAGE_XY),
+            "brightness": OUTAGE_BRIGHTNESS,
             "transition": 0,
         },
         blocking=True,
@@ -354,14 +368,14 @@ async def _clear_persisted_state(hass) -> None:
 
 
 class EdgePocOutageHandler:
-    """Manages the outage → amber → restore lifecycle for the edge PoC.
+    """Manages the outage → blue → restore lifecycle for the edge PoC.
 
     Wired into IemsCoordinator.start() via async_setup_entry.
     Subscribes to voltage state changes on all 4 VOLTAGE_ENTITY_IDS.
     On each state change, calls _grid_is_down() (AND-of-all check).
 
     Lifecycle:
-      all 4 voltages NULL/<50V  →  [60s debounce]  →  capture + amber
+      all 4 voltages NULL/<50V  →  [60s debounce]  →  capture + outage color (blue)
       all 4 voltages ≥50V       →  [60s debounce]  →  restore
 
     The external API (on_grid_off / on_grid_recovered) is preserved for
@@ -385,18 +399,18 @@ class EdgePocOutageHandler:
     def on_grid_off(self) -> None:
         """Called when AND-of-all voltage check concludes grid is down.
 
-        Cancels any pending restore and schedules the amber action after
-        GRID_OFF_DEBOUNCE_S seconds.
+        Cancels any pending restore and schedules the outage-color action
+        after GRID_OFF_DEBOUNCE_S seconds.
         """
-        log.info("edge_poc: grid off detected — scheduling amber (debounce=%.1fs)", GRID_OFF_DEBOUNCE_S)
+        log.info("edge_poc: grid off detected — scheduling outage color (debounce=%.1fs)", GRID_OFF_DEBOUNCE_S)
         self._cancel_restore()
         self._schedule_amber()
 
     def on_grid_recovered(self) -> None:
         """Called when AND-of-all voltage check concludes grid is up.
 
-        Cancels any pending amber (if grid recovered before debounce elapsed)
-        and schedules restore after GRID_ON_DEBOUNCE_S seconds.
+        Cancels any pending outage-color action (if grid recovered before
+        debounce elapsed) and schedules restore after GRID_ON_DEBOUNCE_S seconds.
         """
         log.info("edge_poc: grid recovered — scheduling restore (debounce=%.1fs)", GRID_ON_DEBOUNCE_S)
         self._cancel_amber()
@@ -420,7 +434,7 @@ class EdgePocOutageHandler:
         elif not grid_down and self._outage_active and not self._restore_task:
             self.on_grid_recovered()
         elif not grid_down and not self._outage_active and self._amber_task:
-            # Grid came back before amber debounce fired — cancel it.
+            # Grid came back before outage-color debounce fired — cancel it.
             self._cancel_amber()
 
     # ------------------------------------------------------------------ #
@@ -457,7 +471,7 @@ class EdgePocOutageHandler:
         try:
             await asyncio.sleep(GRID_OFF_DEBOUNCE_S)
         except asyncio.CancelledError:
-            log.debug("edge_poc: amber debounce cancelled (grid recovered before threshold)")
+            log.debug("edge_poc: outage-color debounce cancelled (grid recovered before threshold)")
             return
 
         t0 = time.monotonic()
@@ -466,13 +480,13 @@ class EdgePocOutageHandler:
         try:
             prior = await capture_lamp_state(self._hass, LAMP_ENTITY_ID)
             self._prior_state = prior
-            await apply_amber(self._hass, LAMP_ENTITY_ID, prior)
+            await apply_outage_color(self._hass, LAMP_ENTITY_ID, prior)
             self._outage_active = True
             success = True
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
-            log.error("edge_poc: amber apply failed: %s: %s", type(exc).__name__, exc)
+            log.error("edge_poc: outage-color apply failed: %s: %s", type(exc).__name__, exc)
         finally:
             latency_ms = int((time.monotonic() - t0) * 1000)
             log_event(self._db_path, "grid_off_fire", latency_ms, prior, success)
@@ -525,13 +539,58 @@ class EdgePocOutageHandler:
     # ------------------------------------------------------------------ #
 
     async def async_start(self) -> None:
-        """Check grid state on startup and re-arm if already in outage.
+        """Subscribe to voltage state changes + check grid state on startup.
 
-        Called by async_setup_entry after handler is created. Handles
-        Scenario A (HA restart mid-outage): all voltages already NULL/low,
-        lamp already amber, storage has prior state. We register outage_active
-        so restore fires when grid returns — no re-fire since lamp is already amber.
+        v0.1.13 P0 fix (CEO directive 2026-05-02): subscribe to
+        async_track_state_change_event for all 4 canonical voltage entities so
+        the handler fires automatically on voltage transitions. v0.1.12 was
+        deaf — it registered services but never wired a listener, so the only
+        way to fire the lamp during an outage was a manual service call or a
+        user-wired YAML automation. Neither is acceptable for one-tap install.
+
+        Also handles Scenario A (HA restart mid-outage): all voltages already
+        NULL/low, lamp already showing outage color, storage has prior state.
+        We mark outage_active so restore fires when grid returns — no re-fire
+        since lamp is already in the outage color.
         """
+        # Auto-subscribe to voltage state-changes — this is the core fix.
+        # Wrap the import + subscribe so that test environments without HA
+        # installed still allow the rest of async_start to run (services and
+        # the one-time grid check still work; only the auto-fire path is lost).
+        try:
+            from homeassistant.helpers.event import (  # type: ignore[import]
+                async_track_state_change_event,
+            )
+            from homeassistant.core import callback  # type: ignore[import]
+
+            @callback
+            def _on_voltage_change(event):  # noqa: ARG001 — HA passes the event
+                self.handle_voltage_state_change()
+
+            unsub = async_track_state_change_event(
+                self._hass, list(VOLTAGE_ENTITY_IDS), _on_voltage_change
+            )
+            self._unsub.append(unsub)
+            log.info(
+                "edge_poc: auto-subscribed to %d voltage entities for state-change events",
+                len(VOLTAGE_ENTITY_IDS),
+            )
+        except ImportError as exc:
+            # Test environment without HA installed — keep the handler usable
+            # via registered services. Production HA will always have these.
+            log.warning(
+                "edge_poc: HA helpers unavailable (%s) — running in service-only"
+                " mode; voltage auto-subscribe disabled",
+                exc,
+            )
+        except Exception as exc:  # noqa: BLE001 — never let async_start kill setup
+            log.error(
+                "edge_poc: unexpected error wiring state-change subscription:"
+                " %s: %s — falling back to service-only mode",
+                type(exc).__name__,
+                exc,
+            )
+
         voltage_states = [
             self._hass.states.get(eid) for eid in VOLTAGE_ENTITY_IDS
         ]
