@@ -58,7 +58,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from .classifier import classify
-from .const import BATCH_WINDOW_SECONDS, HEARTBEAT_INTERVAL_SECONDS
+from .const import (
+    BATCH_WINDOW_SECONDS,
+    HEARTBEAT_INTERVAL_SECONDS,
+    MAX_ENTITIES_PER_BATCH_PUBLISH,
+)
 from .mtronic_dispatch import DispatchCapture
 from .telemetry import EmptyBatchError, build_batch, build_heartbeat
 
@@ -228,6 +232,10 @@ class IemsCoordinator:
         self._batch_task: asyncio.Task | None = None
         self._heartbeat_task: asyncio.Task | None = None
         self._started_at = time.monotonic()
+        # Counter for build_batch ValueError swallows — surfaced in heartbeat
+        # next sprint. Existence here is the guardrail that the silent-swallow
+        # regression (2026-05-26 P0) can't recur without screaming.
+        self._flush_rejects: int = 0
 
     # ---------------------- State capture ---------------------------------
 
@@ -397,34 +405,62 @@ class IemsCoordinator:
     # ---------------------- Flush + publish -------------------------------
 
     async def flush(self) -> None:
-        """Finalise sealed-minute accumulators, build a batch, ship it.
+        """Finalise sealed-minute accumulators, build batch(es), ship them.
+
+        v0.2.1 (2026-05-26 hotfix): chunked publish. A 5-min flush window
+        across many active entities can easily produce > 700 minute-rows,
+        which exceeds the AWS IoT Core MQTT v3.1.1 128 KiB message limit
+        (~180 bytes/row → ~700 rows per safe message). We split the row set
+        into sequential chunks of at most MAX_ENTITIES_PER_BATCH_PUBLISH,
+        each its own batch with a fresh batch_id, and publish in order.
 
         The publisher owns retry (via its bounded queue), so we always discard
         the finalised rows after handing off — we never double-ship.
+
+        Build-side rejections (e.g. classifier drift producing an invalid
+        category) are logged at ERROR + tracked in self._flush_rejects so
+        the next silent-swallow regression can't repeat the 2026-05-26 P0.
         """
         rows = self._drain_finalised_rows()
         if not rows:
             return
 
-        try:
-            ha_version = getattr(self._hass.config, "version", "unknown")
-            # v0.5.0: emit country/timezone when HA has them configured.
-            country = getattr(self._hass.config, "country", None) or None
-            timezone = getattr(self._hass.config, "time_zone", None)
-            timezone = str(timezone) if timezone else None
-            payload = build_batch(
-                user_id=self._user_id,
-                entities=rows,
-                ha_version=ha_version,
-                country=country,
-                timezone=timezone,
-            )
-        except EmptyBatchError:
-            return
-        except ValueError as exc:
-            log.warning("flush: build_batch rejected payload: %s", exc)
-            return
-        await self._publisher.publish_telemetry(payload)
+        ha_version = getattr(self._hass.config, "version", "unknown")
+        # v0.5.0: emit country/timezone when HA has them configured.
+        country = getattr(self._hass.config, "country", None) or None
+        timezone = getattr(self._hass.config, "time_zone", None)
+        timezone = str(timezone) if timezone else None
+
+        # Split into MQTT-message-sized chunks. Each chunk is its own batch
+        # with a fresh batch_id (uuid4 inside build_batch), so the ingestion
+        # Lambda treats them as independent for idempotency.
+        chunk_size = MAX_ENTITIES_PER_BATCH_PUBLISH
+        total = len(rows)
+        for offset in range(0, total, chunk_size):
+            chunk = rows[offset:offset + chunk_size]
+            try:
+                payload = build_batch(
+                    user_id=self._user_id,
+                    entities=chunk,
+                    ha_version=ha_version,
+                    country=country,
+                    timezone=timezone,
+                )
+            except EmptyBatchError:
+                # Defensive: range() above ensures chunk is non-empty, but
+                # keep the guard in case the slice math changes.
+                continue
+            except ValueError as exc:
+                # LOUD on purpose. The 2026-05-26 P0 was a silent log.warning
+                # that no one noticed until the dashboard froze for 2h.
+                self._flush_rejects += 1
+                log.error(
+                    "flush: build_batch rejected payload "
+                    "(chunk_rows=%d, total_rows=%d, rejects_total=%d): %s",
+                    len(chunk), total, self._flush_rejects, exc,
+                )
+                continue
+            await self._publisher.publish_telemetry(payload)
 
     async def heartbeat_once(self) -> None:
         ha_version = getattr(self._hass.config, "version", "unknown")

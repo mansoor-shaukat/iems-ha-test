@@ -4,7 +4,7 @@ DOMAIN = "iems"
 # Sprint 6 (2026-05-24): per-minute aggregation in HACS — material architecture
 # change (was raw state_changed forwarding).  Bumping to 0.2.0 so support has a
 # clean cut-line between "raw events" and "pre-aggregated minute rows".
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 
 # Config entry keys — stored in the HA config entry, never logged
 CONF_API_KEY = "api_key"
@@ -64,4 +64,19 @@ HEARTBEAT_TOPIC_TEMPLATE = "iems/{user_id}/heartbeat"
 
 # Schema — MUST match server-side ingestion validator version
 SCHEMA_VERSION = "0.6.0"
-MAX_ENTITIES_PER_BATCH = 500
+
+# Schema-side cap on entities per batch. v0.6.0 bumped this 500 → 5000 in the
+# contract to accommodate the larger per-batch row counts under the new 5-min
+# aggregation cadence (HACS rewrite, 2026-05-24). The HACS-side const lagged
+# until the 2026-05-26 production incident — see docs/followups/
+# freshness_signal_heartbeat_vs_telemetry_2026-05-26.md.
+MAX_ENTITIES_PER_BATCH = 5000
+
+# Publish-side cap on entities per MQTT message. AWS IoT Core's MQTT v3.1.1
+# message limit is 128 KiB; at ~180 bytes/row that's ~700 rows safely under
+# the limit with headroom for the wrapper fields (source, batch_id, ts, etc.).
+# When a flush produces more rows than this, coordinator.flush() splits the
+# row set into sequential chunks, each its own batch with a fresh batch_id.
+# Distinct from MAX_ENTITIES_PER_BATCH (schema cap) by design: the schema
+# allows up to 5000 per batch, but a single MQTT message can't carry that.
+MAX_ENTITIES_PER_BATCH_PUBLISH = 700
