@@ -1,7 +1,10 @@
 """Constants for the iEMS HACS integration."""
 
 DOMAIN = "iems"
-VERSION = "0.1.12"
+# Sprint 6 (2026-05-24): per-minute aggregation in HACS — material architecture
+# change (was raw state_changed forwarding).  Bumping to 0.2.0 so support has a
+# clean cut-line between "raw events" and "pre-aggregated minute rows".
+VERSION = "0.2.0"
 
 # Config entry keys — stored in the HA config entry, never logged
 CONF_API_KEY = "api_key"
@@ -23,9 +26,13 @@ API_KEY_LENGTH = 36  # prefix(10) + body(26)
 API_KEY_REGEX = r"^iems_live_[0-9a-z]{26}$"
 
 # Timing
-BATCH_WINDOW_SECONDS = 30
-HEARTBEAT_INTERVAL_SECONDS = 60
-MAX_QUEUE_DEPTH = 10  # 10 * 30s = 5 minutes of offline buffering
+# Sprint 6 (2026-05-24): with per-minute aggregation in HACS the flush window
+# moves from 30s → 300s (5 minutes).  Each flush carries up to 5 sealed
+# minute-rows per entity.  Heartbeat cadence matches the flush so the publisher
+# queue gets drained on the same tick.
+BATCH_WINDOW_SECONDS = 300
+HEARTBEAT_INTERVAL_SECONDS = 300
+MAX_QUEUE_DEPTH = 10  # 10 batches @ 5min = 50 minutes of offline buffering
 MQTT_CONNECT_TIMEOUT_SECONDS = 10
 MQTT_PUBLISH_TIMEOUT_SECONDS = 10
 BACKOFF_INITIAL_SECONDS = 1
@@ -56,5 +63,5 @@ TELEMETRY_TOPIC_TEMPLATE = "iems/{user_id}/telemetry"
 HEARTBEAT_TOPIC_TEMPLATE = "iems/{user_id}/heartbeat"
 
 # Schema — MUST match server-side ingestion validator version
-SCHEMA_VERSION = "0.5.0"
+SCHEMA_VERSION = "0.6.0"
 MAX_ENTITIES_PER_BATCH = 500

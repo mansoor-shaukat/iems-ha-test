@@ -113,6 +113,16 @@ def build_batch(
             item["area"] = e["area"]
         if e.get("unit"):
             item["unit"] = e["unit"]
+        # Sprint 6 (v0.2.0): per-minute aggregation adds min/max/samples.
+        # These pass through verbatim; the (proposed v0.6.0) contract defines
+        # min/max as numbers and samples as integer >= 1.  Older v0.5.0
+        # consumers ignore them — contract change is additive only.
+        if "min" in e and e["min"] is not None:
+            item["min"] = e["min"]
+        if "max" in e and e["max"] is not None:
+            item["max"] = e["max"]
+        if "samples" in e and e["samples"] is not None:
+            item["samples"] = e["samples"]
         cleaned = _clean_attributes(e.get("attributes"))
         if cleaned:
             item["attributes"] = cleaned

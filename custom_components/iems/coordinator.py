@@ -1,28 +1,64 @@
-"""Coordinator — bridges HA state events, classifier, and publisher.
+"""Coordinator — bridges HA state events, classifier, per-minute aggregator, and publisher.
 
-Responsibilities:
-  - Hold the entity_index (registry snapshot built at async_setup_entry).
-  - Receive state_changed events (via HA's async_track_state_change_event),
-    classify, enrich with brand/area/unit, append to `pending`.
-  - Flush `pending` every BATCH_WINDOW_SECONDS by building a telemetry
-    payload and handing it to the publisher.
-  - Emit a heartbeat every HEARTBEAT_INTERVAL_SECONDS.
-  - For MTronic switch/plug entities: derive dispatch state (shed/import) and
-    immediately forward via dispatch_publisher (if wired).
+Sprint 6 (2026-05-24): per-minute aggregation in HACS.
 
-Pure of HA APIs for the capture/flush/heartbeat paths so unit tests
-only need a MagicMock hass. Real HA wiring lives in __init__.py.
+Why this changed
+----------------
+Until v0.1.15, every HA state_changed event was forwarded as its own telemetry
+row.  The cloud ingestion Lambda then folded each event into a per-minute TS#
+bucket via up to 3 DDB `update_item` calls per event.  At peak that drove ~50K
+DDB writes per 5-min flush window.
+
+CEO sign-off this session: HACS aggregates per minute and per entity locally,
+then ships pre-built minute-bucket rows.  The cloud just stores them.
+
+Per-minute aggregation contract
+-------------------------------
+For every (entity_id, minute_floor) pair we keep an Accumulator:
+    {sum, count, min, max, category, ts, brand, area, unit, attributes}
+
+On each state_changed event:
+  1. Classify and enrich (brand, area, unit, attributes).
+  2. Coerce numeric-category states to float at the HACS boundary.
+  3. Compute the minute-floor of the event ts ("2026-05-24T14:22:00Z").
+  4. If the entity already has a finalised minute later than this event's
+     minute, drop the event (late arrival — HA state ordering is monotonic
+     in practice, this is defensive).
+  5. Update the accumulator: sum += state, count += 1, min/max updated.
+  6. Non-numeric events (category not in _NUMERIC_CATEGORIES) bypass the
+     numeric path and keep a latest-wins passthrough — switches, climate,
+     light state-changes are semantic events, not measurements.
+
+On the 5-min flush boundary (BATCH_WINDOW_SECONDS=300):
+  1. Finalise every accumulator whose minute < current minute.  Each
+     finalised accumulator yields one telemetry row:
+         state   = sum/count  (mean)  — numeric categories
+         min, max, samples = count   — numeric categories
+         state   = latest passthrough — non-numeric categories
+         samples = count               — non-numeric categories
+         ts      = minute_floor + "Z"
+  2. Build the batch, cap at 5 rows per (entity_id) (most-recent wins).
+  3. Hand to the publisher, which owns retry via its bounded queue.
+  4. Reset accumulators for finalised minutes; current-minute accumulator
+     keeps accumulating into the next window.
+
+Heartbeat tick: every HEARTBEAT_INTERVAL_SECONDS (300s, matches flush cadence
+post-Sprint 6).  Calls publisher.drain_queue() so backlogged batches actually
+leave the device.
+
+Pure of HA APIs in the capture/flush/heartbeat paths so unit tests only need a
+MagicMock hass.  Real HA wiring lives in __init__.py.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import time
+from dataclasses import dataclass
 from typing import Any
 
 from .classifier import classify
 from .const import BATCH_WINDOW_SECONDS, HEARTBEAT_INTERVAL_SECONDS
-from .dedup import canonicalize_entity_id
 from .mtronic_dispatch import DispatchCapture
 from .telemetry import EmptyBatchError, build_batch, build_heartbeat
 
@@ -40,9 +76,10 @@ _NUMERIC_CATEGORIES: frozenset[str] = frozenset({
     "meter.energy",
 })
 
-# The synthetic site-level PV aggregate entity published per-batch so that
-# TS#sensor.site_pv_power gets live minute-bucket rows (not just backfill).
-_SITE_PV_ENTITY_ID = "sensor.site_pv_power"
+# Cap the number of finalised minute-rows we ship per entity per flush.
+# At a 5-min flush window we expect at most 5 finalised minutes per entity,
+# but defensive in case a publisher backlog forces a delayed flush.
+_MAX_ROWS_PER_ENTITY: int = 5
 
 log = logging.getLogger("iems.coordinator")
 
@@ -66,116 +103,94 @@ def _coerce_state(raw: str, category: str) -> float | str:
         return raw
 
 
-def _reduce_pv_entities_for_sum(pv_entities: list[dict]) -> list[dict]:
-    """Deduplicate pv_entities before summing for the site-PV aggregate (FIX B).
+def _minute_floor(ts: str) -> str:
+    """Floor an ISO-8601 UTC timestamp to its minute.
 
-    RCA 2026-04-24 (docs/sprints/sprint_03/hacs_0.1.9_classifier_delta.md):
-    the unreduced sum of inverter.pv entries in a 30s batch can reach 85 kW on
-    a 15.4 kWp system because:
+    Input  : "2026-05-24T14:22:37Z"  or  "2026-05-24T14:22:37.182Z"
+    Output : "2026-05-24T14:22:00Z"
 
-    1. Each state_changed event is appended to pending independently — a single
-       entity firing 4 times in a window contributes 4x its value to the sum.
-    2. Per-MPPT-string entities (*_pv1_power, *_pv2_power) are summed alongside
-       their parent aggregate (*_pv_power) — triple-counting a multi-MPPT
-       inverter's generation.
+    Pure string slice (no datetime parsing) to avoid timezone surprises. The
+    HACS boundary normalises ts to '%Y-%m-%dT%H:%M:%SZ' (or with a
+    fractional-seconds variant) — both shapes have the minute at positions
+    14:16 and the seconds component immediately after.
 
-    This function applies two reductions:
-
-    PASS 1 — collapse repeated firings of the same entity_id to a single
-             survivor (the entry with the highest ts in the window).
-
-    PASS 2 — for each canonical entity_id (computed via
-             dedup.canonicalize_entity_id which maps `*_pv1_*` → `*_pv_*`),
-             if the aggregate `*_pv_power` entry is present, drop the numbered
-             per-string variants.  If only per-string variants exist (no
-             aggregate), keep them all so the fallback sum is correct.
+    Falls back to the input unchanged if the string is too short to be ISO.
     """
-    if not pv_entities:
-        return []
-
-    # PASS 1: keep only the latest entry per entity_id (highest ts wins;
-    # stable fallback for missing ts).
-    latest_per_eid: dict[str, dict] = {}
-    for e in pv_entities:
-        eid = e.get("entity_id")
-        if not eid:
-            continue
-        prev = latest_per_eid.get(eid)
-        if prev is None:
-            latest_per_eid[eid] = e
-            continue
-        prev_ts = prev.get("ts") or ""
-        cur_ts = e.get("ts") or ""
-        if cur_ts > prev_ts:
-            latest_per_eid[eid] = e
-
-    # PASS 2: for each canonical group, if the aggregate entity_id
-    # (== canonical) is present, drop the per-string variants.
-    by_canonical: dict[str, list[dict]] = {}
-    for eid, e in latest_per_eid.items():
-        canonical = canonicalize_entity_id(eid)
-        by_canonical.setdefault(canonical, []).append(e)
-
-    reduced: list[dict] = []
-    for canonical, group in by_canonical.items():
-        # Aggregate present? Prefer it and drop the per-string siblings.
-        aggregate = next(
-            (e for e in group if e.get("entity_id") == canonical),
-            None,
-        )
-        if aggregate is not None:
-            reduced.append(aggregate)
-        else:
-            # No aggregate — fall back to summing the per-string entries.
-            reduced.extend(group)
-    return reduced
+    # Minimum length: "2026-05-24T14:22:00Z" == 20 chars; we just need positions
+    # up to index 16 inclusive ("...T14:22") to be present.
+    if len(ts) < 17 or ts[10] != "T":
+        return ts
+    # Slice to "YYYY-MM-DDTHH:MM" then append ":00Z".
+    return ts[:16] + ":00Z"
 
 
-def _build_site_pv_entity(pv_entities: list[dict]) -> dict | None:
-    """Synthesize a site-level PV aggregate entity from per-inverter PV entities.
+@dataclass
+class _MinuteAccumulator:
+    """Per-(entity_id, minute) aggregation state.
 
-    Sums numeric inverter.pv state values in the current batch and returns
-    a synthetic entity for sensor.site_pv_power.  This gives the ingestion
-    Lambda a live numeric value to write into TS#sensor.site_pv_power so the
-    Power History chart has live data (not just backfill/system_totals rows).
+    Numeric categories: sum / count / min / max.  finalise() emits
+        state = sum/count, min, max, samples = count.
 
-    Per FIX B (RCA 2026-04-24) the input list is first reduced by
-    `_reduce_pv_entities_for_sum` to kill the repeated-firing and aggregate+
-    sub-channel double-counts.
-
-    Returns None if no numeric inverter.pv values exist in the batch.
+    Non-numeric categories: latest-wins state_passthrough.  finalise() emits
+        state = state_passthrough, samples = count, no min/max.
     """
-    reduced = _reduce_pv_entities_for_sum(pv_entities)
-
-    total: float = 0.0
-    latest_ts: str | None = None
+    entity_id: str
+    category: str
+    minute_iso: str
+    sum: float = 0.0
+    count: int = 0
+    min: float | None = None
+    max: float | None = None
+    # Latest-seen passthrough state for non-numeric categories.  None when the
+    # category is numeric (we use sum/count to compute the mean instead).
+    state_passthrough: Any = None
+    is_numeric: bool = False
+    # Enrichment fields — copied from the FIRST event for the minute; HA
+    # registry doesn't change inside a minute in practice.
+    brand: str | None = None
+    area: str | None = None
     unit: str | None = None
-    has_numeric = False
+    # Attributes from the latest event in the minute (HA-state-shape).
+    attributes: dict[str, Any] | None = None
 
-    for e in reduced:
-        state = e.get("state")
-        if isinstance(state, (int, float)) and not isinstance(state, bool):
-            total += float(state)
-            has_numeric = True
-        # Keep the most recent timestamp as the aggregate timestamp
-        ts = e.get("ts")
-        if ts is not None and (latest_ts is None or ts > latest_ts):
-            latest_ts = ts
-        if unit is None and e.get("unit"):
-            unit = e["unit"]
+    def update_numeric(self, value: float) -> None:
+        """Fold a numeric measurement into the running aggregate."""
+        self.is_numeric = True
+        self.sum += value
+        self.count += 1
+        if self.min is None or value < self.min:
+            self.min = value
+        if self.max is None or value > self.max:
+            self.max = value
 
-    if not has_numeric or latest_ts is None:
-        return None
+    def update_passthrough(self, value: Any) -> None:
+        """Latest-wins update for non-numeric categories."""
+        self.state_passthrough = value
+        self.count += 1
 
-    entity: dict[str, Any] = {
-        "entity_id": _SITE_PV_ENTITY_ID,
-        "category": "inverter.pv",
-        "ts": latest_ts,
-        "state": total,
-    }
-    if unit:
-        entity["unit"] = unit
-    return entity
+    def finalise(self) -> dict[str, Any]:
+        """Build the telemetry row for this minute."""
+        row: dict[str, Any] = {
+            "entity_id": self.entity_id,
+            "category": self.category,
+            "ts": self.minute_iso,
+        }
+        if self.is_numeric and self.count > 0 and self.min is not None and self.max is not None:
+            row["state"] = self.sum / self.count
+            row["min"] = self.min
+            row["max"] = self.max
+        else:
+            row["state"] = self.state_passthrough
+        row["samples"] = self.count
+        if self.brand:
+            row["brand"] = self.brand
+        if self.area:
+            row["area"] = self.area
+        if self.unit:
+            row["unit"] = self.unit
+        if self.attributes:
+            row["attributes"] = self.attributes
+        return row
 
 
 class IemsCoordinator:
@@ -195,7 +210,20 @@ class IemsCoordinator:
         self._publisher = publisher
         self._dispatch_publisher = dispatch_publisher
         self._dispatch_capture = DispatchCapture(direct_entity_ids=direct_entity_ids)
+
+        # Per-(entity_id, minute_iso) accumulator.
+        self._accumulators: dict[tuple[str, str], _MinuteAccumulator] = {}
+        # Per-entity: the most-recent minute we have already FINALISED (shipped
+        # or queued for shipping).  Used to drop late arrivals for already-sealed
+        # minutes so they don't clobber a fresher row.
+        self._last_finalised_minute: dict[str, str] = {}
+
+        # Back-compat alias for any external reader that used to peek at
+        # `coordinator.pending`.  Always an empty list now — kept so an
+        # accidental ref doesn't AttributeError.  Tests should use the
+        # accumulators / finalisation surface instead.
         self.pending: list[dict] = []
+
         self._unsub_state = None
         self._batch_task: asyncio.Task | None = None
         self._heartbeat_task: asyncio.Task | None = None
@@ -261,22 +289,49 @@ class IemsCoordinator:
         if not classified.get("surface"):
             return
 
-        captured: dict[str, Any] = {
-            "entity_id": entity_id,
-            "category": classified["category"],
-            "ts": ts,
-            "state": _coerce_state(new_state.state, classified["category"]),
-        }
-        if meta.get("brand"):
-            captured["brand"] = meta["brand"]
-        if meta.get("area"):
-            captured["area"] = meta["area"]
-        if meta.get("unit"):
-            captured["unit"] = meta["unit"]
-        if attrs:
-            captured["attributes"] = attrs
+        category: str = classified["category"]
+        state = _coerce_state(new_state.state, category)
+        minute_iso = _minute_floor(ts)
 
-        self.pending.append(captured)
+        # Defensive late-arrival guard: if we have already finalised a LATER
+        # minute for this entity, drop the event.  HA state ordering is
+        # monotonic in practice; this catches the rare clock-skew / replay case.
+        last_final = self._last_finalised_minute.get(entity_id)
+        if last_final is not None and minute_iso < last_final:
+            log.debug(
+                "drop late state_changed for %s: event_min=%s < last_finalised=%s",
+                entity_id, minute_iso, last_final,
+            )
+            return
+
+        key = (entity_id, minute_iso)
+        acc = self._accumulators.get(key)
+        if acc is None:
+            acc = _MinuteAccumulator(
+                entity_id=entity_id,
+                category=category,
+                minute_iso=minute_iso,
+                brand=meta.get("brand"),
+                area=meta.get("area"),
+                unit=meta.get("unit"),
+            )
+            self._accumulators[key] = acc
+
+        # Numeric vs passthrough fork.  bool is a subclass of int — exclude it
+        # explicitly so switch.on/off doesn't get summed.
+        if (
+            category in _NUMERIC_CATEGORIES
+            and isinstance(state, (int, float))
+            and not isinstance(state, bool)
+        ):
+            acc.update_numeric(float(state))
+        else:
+            acc.update_passthrough(state)
+
+        # Always refresh the latest attributes (HA semantics: the most recent
+        # attribute snapshot is the one the cloud should see).
+        if attrs:
+            acc.attributes = attrs
 
     @staticmethod
     def _extract_ts(new_state) -> str:
@@ -291,42 +346,65 @@ class IemsCoordinator:
             iso = iso[:-6] + "Z"
         return iso
 
+    # ---------------------- Minute-boundary finalisation ------------------
+
+    def _current_minute_iso(self) -> str:
+        """Return the wall-clock minute-floor as 'YYYY-MM-DDTHH:MM:00Z'."""
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        return now.strftime("%Y-%m-%dT%H:%M:00Z")
+
+    def _drain_finalised_rows(self, *, current_minute: str | None = None) -> list[dict]:
+        """Finalise accumulators whose minute < current_minute and return their rows.
+
+        Keeps the current-minute accumulator(s) alive so they keep collecting
+        into the next flush window.  Per-entity, retains at most
+        _MAX_ROWS_PER_ENTITY most-recent minute-rows.
+        """
+        current = current_minute or self._current_minute_iso()
+        # Group finalised rows by entity_id so we can apply the per-entity cap.
+        rows_by_entity: dict[str, list[dict]] = {}
+        keys_to_drop: list[tuple[str, str]] = []
+        for key, acc in self._accumulators.items():
+            entity_id, minute_iso = key
+            if minute_iso >= current:
+                continue  # still open — keep accumulating
+            keys_to_drop.append(key)
+            row = acc.finalise()
+            rows_by_entity.setdefault(entity_id, []).append(row)
+            # Track high-water mark so late arrivals get dropped.
+            prev = self._last_finalised_minute.get(entity_id)
+            if prev is None or minute_iso > prev:
+                self._last_finalised_minute[entity_id] = minute_iso
+
+        for key in keys_to_drop:
+            self._accumulators.pop(key, None)
+
+        # Cap each entity to the _MAX_ROWS_PER_ENTITY most recent minute-rows.
+        out: list[dict] = []
+        for entity_id, rows in rows_by_entity.items():
+            rows.sort(key=lambda r: r["ts"])
+            if len(rows) > _MAX_ROWS_PER_ENTITY:
+                dropped = len(rows) - _MAX_ROWS_PER_ENTITY
+                log.warning(
+                    "flush: capping %s to %d rows (dropped %d oldest)",
+                    entity_id, _MAX_ROWS_PER_ENTITY, dropped,
+                )
+                rows = rows[-_MAX_ROWS_PER_ENTITY:]
+            out.extend(rows)
+        return out
+
     # ---------------------- Flush + publish -------------------------------
 
     async def flush(self) -> None:
-        """Drain `pending` into a batch and hand to publisher.
+        """Finalise sealed-minute accumulators, build a batch, ship it.
 
-        The publisher owns retry (via its bounded queue). We always clear
-        `pending` after handing off, so we never double-ship a batch.
-
-        Site-PV aggregate: if any inverter.pv entities are present we inject a
-        synthetic sensor.site_pv_power entity so ingestion writes a live TS#
-        minute-bucket row for the Power History chart.  Per-inverter PV rows
-        continue to land in LATEST# (unchanged), but only the site-aggregate
-        has a TS# row — matching the backfill pattern and Sarah's guidance.
+        The publisher owns retry (via its bounded queue), so we always discard
+        the finalised rows after handing off — we never double-ship.
         """
-        if not self.pending:
+        rows = self._drain_finalised_rows()
+        if not rows:
             return
-        batch = self.pending[:]
-        self.pending.clear()
-
-        # Synthesize site-level PV aggregate from per-inverter PV entities.
-        pv_entities = [e for e in batch if e.get("category") == "inverter.pv"]
-        if pv_entities:
-            site_pv = _build_site_pv_entity(pv_entities)
-            if site_pv is not None:
-                # Only inject if no entity already covers site_pv_power (guard
-                # against double-injection if an inverter integration happens to
-                # publish a site-level aggregate entity directly).
-                existing_ids = {e["entity_id"] for e in batch}
-                if _SITE_PV_ENTITY_ID not in existing_ids:
-                    batch.append(site_pv)
-                    log.debug(
-                        "flush: injected %s state=%.1f W (%d inverter.pv sources)",
-                        _SITE_PV_ENTITY_ID,
-                        site_pv["state"],
-                        len(pv_entities),
-                    )
 
         try:
             ha_version = getattr(self._hass.config, "version", "unknown")
@@ -336,7 +414,7 @@ class IemsCoordinator:
             timezone = str(timezone) if timezone else None
             payload = build_batch(
                 user_id=self._user_id,
-                entities=batch,
+                entities=rows,
                 ha_version=ha_version,
                 country=country,
                 timezone=timezone,
@@ -358,6 +436,18 @@ class IemsCoordinator:
             queue_depth=getattr(self._publisher, "queue_depth", 0),
         )
         await self._publisher.publish_heartbeat(hb)
+        # Drain any backlogged batches the publisher accumulated while the
+        # cloud was unreachable. Isolated from the heartbeat path: a drain
+        # failure must not kill the device's liveness signal.
+        drain = getattr(self._publisher, "drain_queue", None)
+        if drain is not None:
+            try:
+                await drain()
+            except (OSError, TimeoutError, ValueError) as exc:
+                log.warning(
+                    "drain_queue failed during heartbeat: %s: %s",
+                    type(exc).__name__, exc,
+                )
 
     # ---------------------- Background timers -----------------------------
 
