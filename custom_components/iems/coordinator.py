@@ -233,9 +233,34 @@ class IemsCoordinator:
         self._heartbeat_task: asyncio.Task | None = None
         self._started_at = time.monotonic()
         # Counter for build_batch ValueError swallows — surfaced in heartbeat
-        # next sprint. Existence here is the guardrail that the silent-swallow
-        # regression (2026-05-26 P0) can't recur without screaming.
+        # as `flush_rejects` from v0.2.2.  Existence here is the guardrail
+        # that the silent-swallow regression (2026-05-26 P0) can't recur
+        # without screaming.
         self._flush_rejects: int = 0
+
+        # ---- v0.2.2 diagnostic counters (heartbeat surfacing only) ------
+        # Telemetry is dead in prod despite 0.2.1 hotfix.  These counters
+        # let the cloud side see WHICH stage of the pipeline is failing
+        # without HA shell access.  Pure observability — no functional
+        # effect on capture / flush / publish.
+        #
+        # `_batch_loop_iterations`: incremented every time _batch_loop()
+        #   wakes from asyncio.sleep.  If this stays at 0 over uptime,
+        #   the background loop isn't running at all (task GC'd, never
+        #   scheduled, etc.).
+        self._batch_loop_iterations: int = 0
+        # `_last_flush_iso`: wall-clock ISO of the most recent flush() call.
+        #   None until the first flush fires.  If None at uptime > 5min,
+        #   _batch_loop scheduled flush() but it never executed.
+        self._last_flush_iso: str | None = None
+        # `_last_flush_row_count`: how many finalised rows the LAST flush
+        #   handed to the publisher.  0 means "flush fired but accumulator
+        #   was empty" — distinguishes capture failure from flush failure.
+        self._last_flush_row_count: int = 0
+        # `_last_publish_error`: exception type+message of the most recent
+        #   publish_telemetry failure (truncated to 200 chars).  None means
+        #   "no publish errors since start".
+        self._last_publish_error: str | None = None
 
     # ---------------------- State capture ---------------------------------
 
@@ -402,6 +427,35 @@ class IemsCoordinator:
             out.extend(rows)
         return out
 
+    # ---------------------- v0.2.2 diagnostic snapshot --------------------
+
+    def _accumulator_stats(self) -> tuple[int, int, int]:
+        """Snapshot accumulator state for the heartbeat payload.
+
+        Returns
+        -------
+        (entity_count, total_samples, finalised_minutes_pending)
+            entity_count: distinct entity_ids currently held in accumulators.
+            total_samples: sum of `count` across all live accumulators.
+            finalised_minutes_pending: count of accumulator entries whose
+                minute_iso has already rolled past — i.e. they are eligible
+                to be drained by the next flush() call.  If this stays > 0
+                across heartbeats while _last_flush_iso never updates, the
+                batch_loop is dead.
+
+        Pure read of internal state — no mutation.
+        """
+        live_entities: set[str] = set()
+        total_samples = 0
+        current = self._current_minute_iso()
+        pending = 0
+        for (entity_id, minute_iso), acc in self._accumulators.items():
+            live_entities.add(entity_id)
+            total_samples += acc.count
+            if minute_iso < current:
+                pending += 1
+        return (len(live_entities), total_samples, pending)
+
     # ---------------------- Flush + publish -------------------------------
 
     async def flush(self) -> None:
@@ -420,8 +474,24 @@ class IemsCoordinator:
         Build-side rejections (e.g. classifier drift producing an invalid
         category) are logged at ERROR + tracked in self._flush_rejects so
         the next silent-swallow regression can't repeat the 2026-05-26 P0.
+
+        v0.2.2 (2026-05-26): stamps `_last_flush_iso`, `_last_flush_row_count`,
+        and `_last_publish_error` for heartbeat surfacing.  These are pure
+        observability writes — they never alter the data path.  Publisher
+        exceptions are recorded and re-raised so the _batch_loop safety net
+        still handles them exactly as before.
         """
+        # Stamp every flush call — whether or not it actually ships rows.
+        # This lets us distinguish "batch loop is wedged" (last_flush_iso stays
+        # null) from "batch loop runs but accumulator is empty" (last_flush_iso
+        # advances every 5 min while last_flush_row_count stays 0).
+        from datetime import datetime, timezone
+        self._last_flush_iso = datetime.now(timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+
         rows = self._drain_finalised_rows()
+        self._last_flush_row_count = len(rows)
         if not rows:
             return
 
@@ -460,16 +530,36 @@ class IemsCoordinator:
                     len(chunk), total, self._flush_rejects, exc,
                 )
                 continue
-            await self._publisher.publish_telemetry(payload)
+            # v0.2.2: capture publish errors for heartbeat surfacing.  We
+            # RE-RAISE so the existing _batch_loop safety net handles them
+            # exactly as before — pure observability, no behaviour change.
+            try:
+                await self._publisher.publish_telemetry(payload)
+            except Exception as exc:
+                self._last_publish_error = (
+                    f"{type(exc).__name__}: {exc}"
+                )[:200]
+                raise
 
     async def heartbeat_once(self) -> None:
         ha_version = getattr(self._hass.config, "version", "unknown")
+        entity_count, total_samples, pending = self._accumulator_stats()
         hb = build_heartbeat(
             user_id=self._user_id,
             ha_version=ha_version,
             uptime_s=int(time.monotonic() - self._started_at),
             batches_sent=getattr(self._publisher, "batches_sent", 0),
             queue_depth=getattr(self._publisher, "queue_depth", 0),
+            # v0.2.2 diagnostic counters — surface internal pipeline state
+            # so the cloud side can pinpoint where telemetry is dying.
+            flush_rejects=self._flush_rejects,
+            accumulator_entity_count=entity_count,
+            accumulator_total_samples=total_samples,
+            finalised_minutes_pending=pending,
+            batch_loop_iterations=self._batch_loop_iterations,
+            last_flush_iso=self._last_flush_iso,
+            last_flush_row_count=self._last_flush_row_count,
+            last_publish_error=self._last_publish_error,
         )
         await self._publisher.publish_heartbeat(hb)
         # Drain any backlogged batches the publisher accumulated while the
@@ -491,6 +581,10 @@ class IemsCoordinator:
         while True:
             try:
                 await asyncio.sleep(BATCH_WINDOW_SECONDS)
+                # v0.2.2: tick the iteration counter AFTER the sleep returns
+                # so a value of 0 in the heartbeat unambiguously means
+                # "the loop never woke up" (task GC'd, never scheduled, etc.).
+                self._batch_loop_iterations += 1
                 await self.flush()
             except asyncio.CancelledError:
                 raise

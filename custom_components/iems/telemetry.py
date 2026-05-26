@@ -157,13 +157,30 @@ def build_heartbeat(
     uptime_s: int,
     batches_sent: int,
     queue_depth: int,
+    flush_rejects: int | None = None,
+    accumulator_entity_count: int | None = None,
+    accumulator_total_samples: int | None = None,
+    finalised_minutes_pending: int | None = None,
+    batch_loop_iterations: int | None = None,
+    last_flush_iso: str | None = None,
+    last_flush_row_count: int | None = None,
+    last_publish_error: str | None = None,
 ) -> dict:
     """Heartbeat payload — shape per hacs_spec.md §3f.
 
-    Published to `iems/{user_id}/heartbeat` at QoS 0 every 60s.
+    Published to `iems/{user_id}/heartbeat` at QoS 0 every 5 min (Sprint 6).
     Consumed by Priya's CloudWatch metric filter for liveness monitoring.
+
+    v0.2.2 (2026-05-26): diagnostic counters added.  The 0.2.1 hotfix did NOT
+    restore telemetry — heartbeat fires but PROFILE.last_seen_at stays frozen.
+    These fields surface internal coordinator state on the heartbeat row so the
+    cloud side can pinpoint where the pipeline is dying without HA access.
+
+    All diagnostic fields are scalars (int / string / null).  They are emitted
+    only when explicitly provided so older test paths that don't pass them keep
+    working without an empty diagnostics block.
     """
-    return {
+    payload: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "user_id": user_id,
         "ts": _now_iso(),
@@ -173,3 +190,22 @@ def build_heartbeat(
         "batches_sent": int(batches_sent),
         "queue_depth": int(queue_depth),
     }
+    # Diagnostic counters — emitted when supplied (None means "not measured
+    # this tick", null in JSON).  Int counters are coerced to int defensively.
+    if flush_rejects is not None:
+        payload["flush_rejects"] = int(flush_rejects)
+    if accumulator_entity_count is not None:
+        payload["accumulator_entity_count"] = int(accumulator_entity_count)
+    if accumulator_total_samples is not None:
+        payload["accumulator_total_samples"] = int(accumulator_total_samples)
+    if finalised_minutes_pending is not None:
+        payload["finalised_minutes_pending"] = int(finalised_minutes_pending)
+    if batch_loop_iterations is not None:
+        payload["batch_loop_iterations"] = int(batch_loop_iterations)
+    # ISO timestamp + last publish error are nullable strings — explicit None
+    # means "never happened yet" (e.g. flush() has not fired since start-up).
+    payload["last_flush_iso"] = last_flush_iso
+    if last_flush_row_count is not None:
+        payload["last_flush_row_count"] = int(last_flush_row_count)
+    payload["last_publish_error"] = last_publish_error
+    return payload
