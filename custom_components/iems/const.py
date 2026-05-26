@@ -4,7 +4,7 @@ DOMAIN = "iems"
 # Sprint 6 (2026-05-24): per-minute aggregation in HACS — material architecture
 # change (was raw state_changed forwarding).  Bumping to 0.2.0 so support has a
 # clean cut-line between "raw events" and "pre-aggregated minute rows".
-VERSION = "0.2.2"
+VERSION = "0.2.3"
 
 # Config entry keys — stored in the HA config entry, never logged
 CONF_API_KEY = "api_key"
@@ -37,6 +37,19 @@ MQTT_CONNECT_TIMEOUT_SECONDS = 10
 MQTT_PUBLISH_TIMEOUT_SECONDS = 10
 BACKOFF_INITIAL_SECONDS = 1
 BACKOFF_MAX_SECONDS = 60
+
+# v0.2.3 (2026-05-26) — publish-layer retry on awscrt CANCELLED_FOR_CLEAN_SESSION.
+# When awscrt auto-reconnects mid-flight (idle keep-alive miss, network blip),
+# every in-flight publish future is cancelled with this error code.  The
+# resumed connection is healthy, but the publish call already failed.  We
+# retry up to MQTT_PUBLISH_RETRY_ATTEMPTS times with exponential backoff
+# starting at MQTT_PUBLISH_RETRY_INITIAL_SECONDS so the next attempt lands
+# on the resumed connection.  See docs/followups/
+# freshness_signal_heartbeat_vs_telemetry_2026-05-26.md for the live
+# DDB heartbeat row that surfaced this failure mode in production.
+MQTT_PUBLISH_RETRY_ATTEMPTS = 3
+MQTT_PUBLISH_RETRY_INITIAL_SECONDS = 1.0
+MQTT_PUBLISH_RETRY_MAX_SECONDS = 4.0
 
 # Credential refresh — refresh N seconds before STS expiry to avoid
 # in-flight publish failures. Conservative 5-minute window per

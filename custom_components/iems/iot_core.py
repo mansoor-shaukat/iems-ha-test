@@ -21,9 +21,53 @@ import logging
 from typing import Any
 
 from .auth import IemsAuthProvider
-from .const import MQTT_CONNECT_TIMEOUT_SECONDS, MQTT_PUBLISH_TIMEOUT_SECONDS
+from .const import (
+    MQTT_CONNECT_TIMEOUT_SECONDS,
+    MQTT_PUBLISH_RETRY_ATTEMPTS,
+    MQTT_PUBLISH_RETRY_INITIAL_SECONDS,
+    MQTT_PUBLISH_RETRY_MAX_SECONDS,
+    MQTT_PUBLISH_TIMEOUT_SECONDS,
+)
 
 log = logging.getLogger("iems.iot_core")
+
+# v0.2.3 (2026-05-26) — substring-match these awscrt error tokens to decide a
+# publish attempt is retry-eligible.  We match on str(exc) because awscrt
+# raises a single AwsCrtError exception class with a `.name` attribute that
+# carries the symbolic code; matching the substring is cheap, version-tolerant,
+# and survives the awscrt python binding's habit of mutating attribute names
+# across minor releases.  Order matters only for the log line — all entries
+# trigger the same retry path.
+#
+# Live evidence (2026-05-26 HEARTBEAT row):
+#   AwsCrtError: AWS_ERROR_MQTT_CANCELLED_FOR_CLEAN_SESSION:
+#     Old requests from the previous session are cancelled,
+#     and offline request will not be accept.
+#
+# We also include the broader CANCELLED token and the offline-request token
+# because the same root cause (publish issued in a reconnect window) can
+# surface as either depending on which side of the resume callback we land on.
+_RETRYABLE_AWSCRT_TOKENS: tuple[str, ...] = (
+    "AWS_ERROR_MQTT_CANCELLED_FOR_CLEAN_SESSION",
+    "AWS_ERROR_MQTT_CONNECTION_DISCONNECTING",
+    "AWS_ERROR_MQTT_NOT_CONNECTED",
+)
+
+
+def _is_retryable_awscrt_error(exc: BaseException) -> bool:
+    """Return True if exc is a known transient awscrt publish failure.
+
+    The publisher-layer retry catches these and re-issues the publish after
+    a short sleep so the next attempt can land on a resumed connection.
+    Caller is responsible for the sleep + attempt counting; this helper is
+    a pure predicate so tests can assert classification independently from
+    timing behaviour.
+    """
+    exc_name = type(exc).__name__
+    if exc_name != "AwsCrtError":
+        return False
+    msg = str(exc)
+    return any(token in msg for token in _RETRYABLE_AWSCRT_TOKENS)
 
 
 class IotCorePublisher:
@@ -110,27 +154,82 @@ class IotCorePublisher:
                 ) from exc
 
         payload_bytes = json.dumps(payload, separators=(",", ":")).encode()
+        qos_enum = self._qos_enum(qos)
 
-        try:
-            pub_future, _ = self._connection.publish(
-                topic=topic,
-                payload=payload_bytes,
-                qos=self._qos_enum(qos),
-            )
-            loop = asyncio.get_event_loop()
-            await asyncio.wait_for(
-                loop.run_in_executor(None, pub_future.result),
-                timeout=MQTT_PUBLISH_TIMEOUT_SECONDS,
-            )
-            return True
-        except Exception as exc:
-            exc_name = type(exc).__name__
-            # awscrt raises AwsCrtError; check message for token expiry
-            if "ExpiredToken" in exc_name or "ExpiredToken" in str(exc):
-                log.warning("iot_core: credentials expired — reconnecting")
-                await self._reconnect_with_fresh_creds()
-            log.error("iot_core: publish failed topic=%s exc=%s: %s", topic, exc_name, exc)
-            raise
+        # v0.2.3 retry loop — re-issues the publish on AWS_ERROR_MQTT_CANCELLED_
+        # FOR_CLEAN_SESSION (and friends).  These errors surface when awscrt
+        # auto-reconnects in the middle of a chunked-publish sequence: every
+        # in-flight publish future is cancelled by the broker even though the
+        # resumed connection is healthy.  A short sleep + retry on the same
+        # connection object recovers without bouncing creds.  See
+        # _is_retryable_awscrt_error for the classification rule.
+        delay = MQTT_PUBLISH_RETRY_INITIAL_SECONDS
+        last_exc: BaseException | None = None
+        for attempt in range(1, MQTT_PUBLISH_RETRY_ATTEMPTS + 1):
+            try:
+                await self._publish_once(
+                    topic=topic, payload_bytes=payload_bytes, qos_enum=qos_enum,
+                )
+                if attempt > 1:
+                    log.info(
+                        "iot_core: publish recovered on attempt %d/%d topic=%s",
+                        attempt, MQTT_PUBLISH_RETRY_ATTEMPTS, topic,
+                    )
+                return True
+            except Exception as exc:
+                last_exc = exc
+                exc_name = type(exc).__name__
+                # ExpiredToken is its own recovery path — tear down + fresh
+                # creds, then re-raise so the publisher layer enqueues.
+                if "ExpiredToken" in exc_name or "ExpiredToken" in str(exc):
+                    log.warning("iot_core: credentials expired — reconnecting")
+                    await self._reconnect_with_fresh_creds()
+                    log.error(
+                        "iot_core: publish failed topic=%s exc=%s: %s",
+                        topic, exc_name, exc,
+                    )
+                    raise
+                # Retry path: known transient awscrt errors during reconnect.
+                if _is_retryable_awscrt_error(exc) and attempt < MQTT_PUBLISH_RETRY_ATTEMPTS:
+                    log.warning(
+                        "iot_core: publish attempt %d/%d hit transient awscrt error, "
+                        "retrying in %.1fs topic=%s exc=%s: %s",
+                        attempt, MQTT_PUBLISH_RETRY_ATTEMPTS, delay,
+                        topic, exc_name, exc,
+                    )
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, MQTT_PUBLISH_RETRY_MAX_SECONDS)
+                    continue
+                # Non-retryable or attempts exhausted — log and surface.
+                log.error(
+                    "iot_core: publish failed topic=%s attempt=%d exc=%s: %s",
+                    topic, attempt, exc_name, exc,
+                )
+                raise
+
+        # Unreachable in practice — the loop above either returns True or
+        # raises.  Defensive belt-and-braces so static analysis is happy.
+        if last_exc is not None:
+            raise last_exc
+        return False
+
+    async def _publish_once(self, *, topic: str, payload_bytes: bytes, qos_enum) -> None:
+        """Single attempt at a publish — issues the awscrt future and awaits ACK.
+
+        Split out from publish() so the retry loop can re-issue cleanly without
+        re-serialising the payload or re-resolving the QoS enum.  Always raises
+        on failure; caller decides whether to retry, reconnect, or surface.
+        """
+        pub_future, _ = self._connection.publish(
+            topic=topic,
+            payload=payload_bytes,
+            qos=qos_enum,
+        )
+        loop = asyncio.get_event_loop()
+        await asyncio.wait_for(
+            loop.run_in_executor(None, pub_future.result),
+            timeout=MQTT_PUBLISH_TIMEOUT_SECONDS,
+        )
 
     # ------------------------------------------------------------------
     # Internal helpers
