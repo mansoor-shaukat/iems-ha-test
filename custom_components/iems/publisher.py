@@ -27,6 +27,37 @@ log = logging.getLogger("iems.publisher")
 PublishFn = Callable[..., Awaitable[bool]]
 
 
+# v0.2.5 (2026-05-26) — DATA-LOSS FIX: catch awscrt errors in _safe_publish.
+#
+# Pre-v0.2.5, `_safe_publish` only caught (OSError, TimeoutError, ValueError).
+# When iot_core.publish() exhausted its v0.2.3 retry loop on a persistent
+# AWS_ERROR_MQTT_CANCELLED_FOR_CLEAN_SESSION, the AwsCrtError propagated
+# UNCAUGHT out of _safe_publish.  The `publish_telemetry`'s
+# `self._queue.append(payload)` line never executed.  Every failed flush
+# dropped its full row set (5h+ of production data lost on 2026-05-26).
+#
+# Fix: import awscrt.exceptions.AwsCrtError lazily and add it to the except
+# tuple.  awscrt is required at runtime (declared in manifest.json) but
+# unit tests run without it — so we import lazily and silently degrade
+# (the type-name check below still catches doubles raised in tests).
+try:  # pragma: no cover — import path varies by env
+    from awscrt.exceptions import AwsCrtError as _AwsCrtError
+except Exception:  # noqa: BLE001 — awscrt not installed in test env
+    _AwsCrtError = None  # type: ignore[assignment]
+
+
+def _is_awscrt_error(exc: BaseException) -> bool:
+    """True if exc is awscrt.exceptions.AwsCrtError OR a test double of it.
+
+    Production: matches by isinstance against the real class.
+    Tests: matches by class-name string so test doubles need not depend on
+    awscrt.  This mirrors the classifier predicate in iot_core.py.
+    """
+    if _AwsCrtError is not None and isinstance(exc, _AwsCrtError):
+        return True
+    return type(exc).__name__ == "AwsCrtError"
+
+
 def backoff_sequence(max_attempts: int = 10):
     """Yield exponential backoff delays capped at BACKOFF_MAX_SECONDS.
 
@@ -68,13 +99,34 @@ class TelemetryPublisher:
     # ----------------------------- Publish -----------------------------------
 
     async def _safe_publish(self, *, topic: str, payload: dict, qos: int) -> bool:
-        """Call publish_fn, convert any exception to a publish failure."""
+        """Call publish_fn, convert any expected exception to a publish failure.
+
+        Caught:
+          - OSError / TimeoutError / ValueError — local socket / timeout /
+            programming errors.
+          - awscrt.exceptions.AwsCrtError — surfaces when iot_core's v0.2.3
+            retry loop has exhausted its 5 attempts on a persistent broker
+            failure (e.g. AWS_ERROR_MQTT_CANCELLED_FOR_CLEAN_SESSION before
+            v0.2.5's persistent-session fix lands a clean reconnect).
+            Catching here means publish_telemetry() can enqueue the batch
+            into self._queue instead of dropping it on the floor — this is
+            the data-loss fix that closes the 2026-05-26 production gap.
+        """
         try:
             return bool(await self._publish_fn(topic=topic, payload=payload, qos=qos))
         except (OSError, TimeoutError, ValueError) as exc:
             log.warning("publish error on %s: %s: %s",
                         topic, type(exc).__name__, exc)
             return False
+        except Exception as exc:  # noqa: BLE001 — narrowed by _is_awscrt_error below
+            if _is_awscrt_error(exc):
+                log.warning(
+                    "publish awscrt error on %s (will enqueue): %s: %s",
+                    topic, type(exc).__name__, exc,
+                )
+                return False
+            # Anything else is unexpected — surface so coordinator/tests see it.
+            raise
 
     async def publish_telemetry(self, payload: dict) -> bool:
         """Attempt to publish a telemetry batch. Enqueue on failure."""

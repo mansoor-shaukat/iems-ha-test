@@ -4,7 +4,7 @@ DOMAIN = "iems"
 # Sprint 6 (2026-05-24): per-minute aggregation in HACS — material architecture
 # change (was raw state_changed forwarding).  Bumping to 0.2.0 so support has a
 # clean cut-line between "raw events" and "pre-aggregated minute rows".
-VERSION = "0.2.3"
+VERSION = "0.2.5"
 
 # Config entry keys — stored in the HA config entry, never logged
 CONF_API_KEY = "api_key"
@@ -47,7 +47,15 @@ BACKOFF_MAX_SECONDS = 60
 # on the resumed connection.  See docs/followups/
 # freshness_signal_heartbeat_vs_telemetry_2026-05-26.md for the live
 # DDB heartbeat row that surfaced this failure mode in production.
-MQTT_PUBLISH_RETRY_ATTEMPTS = 3
+#
+# v0.2.5 (2026-05-26) — bumped attempts 3 → 5.  Total retry window now
+# ~15s (was ~7s).  v0.2.5 also flips clean_session=False so the broker
+# queues across reconnects; the retry loop is now the INNER cushion for
+# intra-flap failures, not the primary defence.  Two flaps inside ~7s
+# was observed in production (114 finalised minutes pending after the
+# v0.2.3 retry exhausted); 5 attempts × 1/2/4/4/4s = 15s cushion covers
+# the wider flap window.
+MQTT_PUBLISH_RETRY_ATTEMPTS = 5
 MQTT_PUBLISH_RETRY_INITIAL_SECONDS = 1.0
 MQTT_PUBLISH_RETRY_MAX_SECONDS = 4.0
 

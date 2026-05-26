@@ -38,10 +38,57 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# v0.2.4 (2026-05-26) — value-side JSON-safety pass on HA attribute dicts.
+# v0.2.3 fixed the publisher-layer awscrt cancellation, exposing a deeper bug:
+# `json.dumps(payload)` in iot_core.py raised `TypeError: Object of type set is
+# not JSON serializable` because some HA integrations expose attribute values
+# as `set` (Hue `effect_list`, Z-Wave `option_groups`, climate `hvac_modes`,
+# etc.).  `_clean_attributes` only filtered KEYS; values flowed through raw.
+# We now coerce every value to a JSON-safe shape, drop anything we can't
+# round-trip (datetime, custom HA classes), and preserve falsy scalars
+# (0/False/"") which are semantically meaningful in telemetry.
+_JSON_SCALARS = (str, int, float, bool, type(None))
+
+
+def _coerce_value(v: Any) -> Any:
+    """Coerce an HA attribute value to a JSON-serializable shape.
+
+    Returns None for values we cannot safely round-trip (datetime, custom
+    classes, etc.).  Callers must distinguish "coerced to None" from the
+    legitimate scalar `None` — see `_clean_attributes` below.
+    """
+    if isinstance(v, bool) or isinstance(v, _JSON_SCALARS):
+        # bool first because bool is a subclass of int — order matters only
+        # for documentation; both branches are JSON-safe.
+        return v
+    if isinstance(v, (set, frozenset)):
+        # Sort by str() for determinism in snapshot/diff tests.  HA sets are
+        # typically small (mode lists, effect lists), so the cost is trivial.
+        return sorted(v, key=str)
+    if isinstance(v, tuple):
+        return [_coerce_value(x) for x in v]
+    if isinstance(v, list):
+        return [_coerce_value(x) for x in v]
+    if isinstance(v, dict):
+        return {str(k): _coerce_value(val) for k, val in v.items()}
+    # datetime, custom HA classes, etc. — drop.  Telemetry doesn't need them.
+    return None
+
+
 def _clean_attributes(attrs: dict[str, Any] | None) -> dict[str, Any] | None:
     if not attrs:
         return None
-    cleaned = {k: v for k, v in attrs.items() if k not in ATTRIBUTE_STRIP_KEYS}
+    cleaned: dict[str, Any] = {}
+    for k, v in attrs.items():
+        if k in ATTRIBUTE_STRIP_KEYS:
+            continue
+        coerced = _coerce_value(v)
+        # Keep the field if (a) the value coerced to something non-None, or
+        # (b) the original value was an explicit JSON scalar — which covers
+        # legitimate None / False / 0 / "".  This drops only values that
+        # _coerce_value rejected (datetime, custom classes, etc.).
+        if coerced is not None or isinstance(v, _JSON_SCALARS):
+            cleaned[k] = coerced
     return cleaned or None
 
 

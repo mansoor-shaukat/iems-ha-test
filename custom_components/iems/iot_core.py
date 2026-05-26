@@ -275,22 +275,56 @@ class IotCorePublisher:
                 loop.call_soon_threadsafe(self._mark_disconnected)
 
         def _on_resumed(connection, return_code, session_present, **_kwargs) -> None:
-            """Called on awscrt thread when awscrt auto-reconnects."""
+            """Called on awscrt thread when awscrt auto-reconnects.
+
+            v0.2.5: connection now uses clean_session=False, so on resume the
+            broker reports session_present=True and replays every QoS 1
+            publish that was queued for this ClientId during the disconnect
+            window.  Log that explicitly so the production HEARTBEAT log
+            line tells us whether the persistent-session path actually
+            engaged.  session_present=False after a resume means the broker
+            either expired the session (>1h offline) or this is the first
+            connect of a new ClientId — both worth seeing in the logs.
+            """
             log.info(
-                "iot_core: connection resumed rc=%s session_present=%s",
+                "iot_core: connection resumed rc=%s session_present=%s "
+                "(queued QoS 1 publishes will be replayed by broker if True)",
                 return_code, session_present,
             )
             loop = self._event_loop
             if loop is not None and loop.is_running():
                 loop.call_soon_threadsafe(self._mark_connected)
 
+        # v0.2.5 (2026-05-26) — clean_session=False enables AWS IoT Core
+        # MQTT 3.1.1 persistent sessions.  The broker queues QoS 1 publishes
+        # across the brief disconnect windows that awscrt's auto-reconnect
+        # produces (keep-alive miss every 30s, network blip, broker hangup);
+        # without this, every in-flight publish at reconnect time is
+        # cancelled with AWS_ERROR_MQTT_CANCELLED_FOR_CLEAN_SESSION (which
+        # is exactly the production failure mode v0.2.2's heartbeat
+        # diagnostics captured on 2026-05-26).
+        #
+        # Persistent session TTL: AWS IoT Core default is 1 hour.  ClientId
+        # is the Cognito Identity ID (stable across DAI credential refresh
+        # — IAM policy condition at line 262-264 keys off identity_id, not
+        # the temp creds' session_token).  Per AWS IoT MQTT docs:
+        # "In MQTT 3, the default value of persistent sessions expiration
+        # time is an hour, and this applies to all the sessions in the
+        # account."  See:
+        # https://docs.aws.amazon.com/iot/latest/developerguide/mqtt.html#mqtt-persistent-sessions
+        #
+        # The v0.2.3 retry loop (publish() above) stays — it is the inner
+        # cushion that handles the publish-side cancellation if a flap
+        # happens within a single attempt.  v0.2.5 + v0.2.3 layer cleanly:
+        # broker queue absorbs cross-reconnect publishes, retry loop
+        # absorbs intra-flap publishes.
         connection = mqtt_connection_builder.websockets_with_default_aws_signing(
             endpoint=creds.iot_endpoint,
             region=creds.region,
             credentials_provider=credentials_provider,
             client_bootstrap=client_bootstrap,
             client_id=client_id,
-            clean_session=True,
+            clean_session=False,
             keep_alive_secs=30,
             on_connection_interrupted=_on_interrupted,
             on_connection_resumed=_on_resumed,
