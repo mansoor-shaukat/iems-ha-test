@@ -75,10 +75,20 @@ class PayloadTooLargeError(Exception):
 # We also include the broader CANCELLED token and the offline-request token
 # because the same root cause (publish issued in a reconnect window) can
 # surface as either depending on which side of the resume callback we land on.
+#
+# v0.2.7 (2026-05-28) — added AWS_ERROR_MQTT_CONNECTION_DESTROYED.  The
+# publisher-layer queue (publisher.py `_is_awscrt_error`) already absorbs
+# this token, so it was never data-loss; but the inner publish-side retry
+# loop recovers faster (one short sleep on the same coroutine) than the
+# outer queue-and-drain-next-heartbeat cycle (up to 5 min round-trip).
+# Observed in the live HA log when awscrt tears down the connection
+# struct after a session-level fault; reconnect callback usually fires
+# within ~1s and the retry lands on the new connection cleanly.
 _RETRYABLE_AWSCRT_TOKENS: tuple[str, ...] = (
     "AWS_ERROR_MQTT_CANCELLED_FOR_CLEAN_SESSION",
     "AWS_ERROR_MQTT_CONNECTION_DISCONNECTING",
     "AWS_ERROR_MQTT_NOT_CONNECTED",
+    "AWS_ERROR_MQTT_CONNECTION_DESTROYED",
 )
 
 

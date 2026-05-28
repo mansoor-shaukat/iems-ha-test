@@ -4,7 +4,7 @@ DOMAIN = "iems"
 # Sprint 6 (2026-05-24): per-minute aggregation in HACS — material architecture
 # change (was raw state_changed forwarding).  Bumping to 0.2.0 so support has a
 # clean cut-line between "raw events" and "pre-aggregated minute rows".
-VERSION = "0.2.6"
+VERSION = "0.2.7"
 
 # Config entry keys — stored in the HA config entry, never logged
 CONF_API_KEY = "api_key"

@@ -533,6 +533,18 @@ class IemsCoordinator:
             # v0.2.2: capture publish errors for heartbeat surfacing.  We
             # RE-RAISE so the existing _batch_loop safety net handles them
             # exactly as before — pure observability, no behaviour change.
+            #
+            # v0.2.7 (2026-05-28): CLEAR `_last_publish_error` on success.
+            # Pre-v0.2.7 the field was sticky — set on failure, NEVER cleared
+            # on a subsequent successful publish.  A single transient publish
+            # error (e.g. one /hacs-auth `ClientConnectorDNSError` observed
+            # live on 2026-05-28) would pollute the heartbeat field for the
+            # rest of HA uptime even though every subsequent flush succeeded
+            # and DDB stayed fresh.  Portal freshness consumers reading this
+            # field would render "unhealthy" indefinitely — the freshness
+            # signal lied because the field reflected HISTORICAL failure,
+            # not CURRENT state.  Clear on success so the heartbeat reflects
+            # the latest publish outcome.
             try:
                 await self._publisher.publish_telemetry(payload)
             except Exception as exc:
@@ -540,6 +552,11 @@ class IemsCoordinator:
                     f"{type(exc).__name__}: {exc}"
                 )[:200]
                 raise
+            else:
+                # Publish succeeded — the most recent failure (if any) is
+                # no longer the CURRENT state.  Clear so the heartbeat
+                # consumer sees an honest "no failures since last flush".
+                self._last_publish_error = None
 
     async def heartbeat_once(self) -> None:
         ha_version = getattr(self._hass.config, "version", "unknown")
