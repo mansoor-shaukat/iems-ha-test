@@ -1166,20 +1166,39 @@ class IemsCoordinator:
             except Exception as exc:  # pragma: no cover
                 log.error("heartbeat crashed: %s: %s", type(exc).__name__, exc)
 
-    async def start(self) -> None:
-        # v0.1.14: Schedule long-running loops via hass.async_create_task when
-        # available. Plain asyncio.create_task only stores a WEAK reference in
-        # the event loop — the task can be silently garbage-collected mid-flight
-        # (Python asyncio docs §asyncio.create_task). Fall back to
-        # asyncio.create_task in test envs where hass is a MagicMock that doesn't
-        # implement async_create_task with the right signature.
-        # See edge_poc_outage._schedule_amber for the full rationale + the
-        # 2026-05-02 production incident that surfaced this bug class.
-        create_task = getattr(self._hass, "async_create_task", None)
-        if callable(create_task):
-            self._batch_task = create_task(self._batch_loop())
-            self._heartbeat_task = create_task(self._heartbeat_loop())
+    async def start(self, entry: Any = None) -> None:
+        # v0.4.1 (2026-06-04) — BOOTSTRAP FIX.  These are never-ending loops;
+        # they MUST NOT be awaited during config-entry setup or HA's bootstrap
+        # "wait for platforms" stage blocks forever and the supervisor watchdog
+        # restart-loops the install (the 0.4.0 prod incident — HA logged
+        # "Setup timed out for bootstrap waiting on" _batch_loop/_heartbeat_loop).
+        #
+        # `ConfigEntry.async_create_background_task` (HA 2022.8+) is the correct
+        # API: it keeps a STRONG ref (so the v0.1.14 weak-ref GC bug can't
+        # recur) AND registers the task as a BACKGROUND task that HA does NOT
+        # await at bootstrap.  `hass.async_create_task`/`entry.async_create_task`
+        # (the old path) register FOREGROUND tasks that ARE awaited — wrong for
+        # an infinite loop.
+        #
+        # Fallback ladder for older HA cores / test envs:
+        #   entry.async_create_background_task  -> hass.async_create_background_task
+        #   -> asyncio.create_task (test MagicMock hass / no entry).
+        bg_entry = getattr(entry, "async_create_background_task", None)
+        bg_hass = getattr(self._hass, "async_create_background_task", None)
+        if callable(bg_entry):
+            self._batch_task = bg_entry(
+                self._hass, self._batch_loop(), name="iems_batch_loop"
+            )
+            self._heartbeat_task = bg_entry(
+                self._hass, self._heartbeat_loop(), name="iems_heartbeat_loop"
+            )
+        elif callable(bg_hass):
+            self._batch_task = bg_hass(self._batch_loop(), name="iems_batch_loop")
+            self._heartbeat_task = bg_hass(
+                self._heartbeat_loop(), name="iems_heartbeat_loop"
+            )
         else:
+            # Test env (MagicMock hass) or HA core too old for background tasks.
             self._batch_task = asyncio.create_task(self._batch_loop())
             self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 

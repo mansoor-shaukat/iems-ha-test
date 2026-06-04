@@ -37,6 +37,7 @@ from .const import (
     CONF_REGION,
     CONF_USER_ID,
     DOMAIN,
+    SETUP_CLOUD_OP_TIMEOUT_S,
     VERSION,
 )
 
@@ -151,13 +152,21 @@ if _HA_AVAILABLE:
         # First credential exchange. This is the integration's ONE
         # allowed outbound call during setup that can touch the cloud —
         # failure here blocks startup.
+        #
+        # v0.4.1 (2026-06-04) — BOOTSTRAP FIX: bound the whole exchange with an
+        # explicit wait_for. The auth provider has internal HTTP + boto3
+        # timeouts, but this belt-and-braces ceiling guarantees setup can't
+        # wedge HA bootstrap on a partially-hung cloud call. A timeout surfaces
+        # as ConfigEntryNotReady → HA retries with backoff and the install boots.
         try:
-            creds = await auth.get_credentials()
+            creds = await asyncio.wait_for(
+                auth.get_credentials(), timeout=SETUP_CLOUD_OP_TIMEOUT_S
+            )
         except AuthExchangeError as exc:
             # Likely revoked or wrong key — user needs to re-enter.
             raise ConfigEntryAuthFailed(f"iEMS auth exchange failed: {exc}") from exc
-        except (OSError, TimeoutError) as exc:
-            # Network hiccup — HA will retry.
+        except (OSError, TimeoutError, asyncio.TimeoutError) as exc:
+            # Network hiccup / cloud slow — HA will retry with backoff.
             raise ConfigEntryNotReady(f"iEMS cloud unreachable: {exc}") from exc
 
         log.info(
@@ -173,7 +182,17 @@ if _HA_AVAILABLE:
         # wire after Priya's spec lands.
         from .iot_core import IotCorePublisher
         adapter = IotCorePublisher(auth_provider=auth)
-        await adapter.connect()
+        # v0.4.1 — bound the initial connect so a hung MQTT handshake can't
+        # wedge bootstrap. adapter.connect() already times the awscrt connect
+        # future at MQTT_CONNECT_TIMEOUT_SECONDS; this is the outer ceiling.
+        try:
+            await asyncio.wait_for(
+                adapter.connect(), timeout=SETUP_CLOUD_OP_TIMEOUT_S
+            )
+        except (OSError, TimeoutError, asyncio.TimeoutError) as exc:
+            raise ConfigEntryNotReady(
+                f"iEMS IoT Core connect timed out: {exc}"
+            ) from exc
 
         # Registry snapshot
         entity_index = _build_entity_index(hass)
@@ -201,7 +220,12 @@ if _HA_AVAILABLE:
         )
         coordinator._unsub_state = unsub
 
-        await coordinator.start()
+        # v0.4.1 — pass `entry` so the batch + heartbeat loops are scheduled as
+        # BACKGROUND tasks (entry.async_create_background_task), which HA does
+        # NOT await at bootstrap. The 0.4.0 prod incident logged "Setup timed
+        # out for bootstrap waiting on" these loops because they were foreground
+        # tasks (hass.async_create_task).
+        await coordinator.start(entry)
 
         # Onboarding v2 (#4, ADR 0005) — setup snapshot.
         # The snapshot is the ONE payload that flows pre-confirmation. We
@@ -223,15 +247,6 @@ if _HA_AVAILABLE:
             publisher=publisher,
             collect=_collect,
         )
-        # Fire the first-install snapshot. Failure is non-fatal — the manager
-        # logs + leaves the one-off guard unset so a later setup retry re-fires.
-        try:
-            await snapshot_manager.publish_on_first_install()
-        except (OSError, TimeoutError, ValueError) as exc:
-            log.warning(
-                "iems: first-install setup snapshot failed (non-fatal): %s: %s",
-                type(exc).__name__, exc,
-            )
 
         # Onboarding v2 (#9, ADR 0005) — shipping-mode command channel.
         # Subscribe to the cloud→HACS command down-topic (QoS 1, persistent
@@ -270,35 +285,76 @@ if _HA_AVAILABLE:
 
         adapter.set_on_resume(_reconcile_on_resume)
 
-        # Initial subscribe.  Non-fatal on failure — the resume hook re-issues
-        # it on the next reconnect, and telemetry gating defaults safe (`setup`
-        # = no telemetry) so a missed command can't leak data.
-        try:
-            await adapter.subscribe(
-                topic=command_topic,
-                qos=1,
-                message_handler=command_handler.on_message,
-            )
-        except (OSError, TimeoutError) as exc:
-            log.warning(
-                "iems: command-topic subscribe failed (will retry on resume): "
-                "%s: %s",
-                type(exc).__name__, exc,
-            )
+        # v0.4.1 (2026-06-04) — BOOTSTRAP FIX: the post-connect onboarding
+        # network work (first-install snapshot publish, command-topic subscribe,
+        # startup /hacs/status reconcile) is the cluster that wedged 0.4.0
+        # bootstrap on prod. None of it gates whether the integration can run —
+        # telemetry defaults safe (`setup` = no telemetry until the cloud
+        # commands `active`), the resume hook re-issues the subscribe on the
+        # next reconnect, and a missed reconcile recovers on the next status
+        # pull. So it MUST NOT block async_setup_entry. We defer all three to a
+        # single background task that HA does NOT await at bootstrap.
+        #
+        # Onboarding behavior is fully preserved — the snapshot still publishes,
+        # the command topic is still subscribed, and status still reconciles —
+        # they just happen a beat after setup returns rather than blocking it.
+        async def _deferred_onboarding_wiring() -> None:
+            # First-install setup snapshot. Failure is non-fatal — the manager
+            # logs + leaves the one-off guard unset so a later setup retry
+            # re-fires. Bounded so a hung publish can't pin this task forever.
+            try:
+                await asyncio.wait_for(
+                    snapshot_manager.publish_on_first_install(),
+                    timeout=SETUP_CLOUD_OP_TIMEOUT_S,
+                )
+            except (OSError, TimeoutError, asyncio.TimeoutError, ValueError) as exc:
+                log.warning(
+                    "iems: first-install setup snapshot failed (non-fatal): %s: %s",
+                    type(exc).__name__, exc,
+                )
 
-        # Initial reconcile — pull /hacs/status once at startup so a HACS
-        # restart (config-entry reload) adopts the cloud's current mode rather
-        # than resetting to the `setup` default.  Non-fatal; degrades to the
-        # default mode if the endpoint is unavailable.
-        try:
-            startup_status = await status_client.fetch_status()
-            if startup_status is not None:
-                coordinator.reconcile_from_status(startup_status)
-        except (OSError, TimeoutError) as exc:
-            log.warning(
-                "iems: startup /hacs/status pull failed (non-fatal): %s: %s",
-                type(exc).__name__, exc,
-            )
+            # Initial command-topic subscribe. Non-fatal on failure — the resume
+            # hook re-issues it on the next reconnect, and telemetry gating
+            # defaults safe (`setup` = no telemetry) so a missed command can't
+            # leak data.
+            try:
+                await asyncio.wait_for(
+                    adapter.subscribe(
+                        topic=command_topic,
+                        qos=1,
+                        message_handler=command_handler.on_message,
+                    ),
+                    timeout=SETUP_CLOUD_OP_TIMEOUT_S,
+                )
+            except (OSError, TimeoutError, asyncio.TimeoutError) as exc:
+                log.warning(
+                    "iems: command-topic subscribe failed (will retry on "
+                    "resume): %s: %s",
+                    type(exc).__name__, exc,
+                )
+
+            # Initial reconcile — pull /hacs/status once so a HACS restart
+            # (config-entry reload) adopts the cloud's current mode rather than
+            # resetting to the `setup` default. Non-fatal; degrades to the
+            # default mode if the endpoint is unavailable. status_client already
+            # times out internally and returns None on any failure.
+            try:
+                startup_status = await status_client.fetch_status()
+                if startup_status is not None:
+                    coordinator.reconcile_from_status(startup_status)
+            except (OSError, TimeoutError, asyncio.TimeoutError) as exc:
+                log.warning(
+                    "iems: startup /hacs/status pull failed (non-fatal): %s: %s",
+                    type(exc).__name__, exc,
+                )
+
+        # Schedule as a BACKGROUND task (HA does not await it at bootstrap).
+        # Fallback ladder mirrors coordinator.start for older cores / safety.
+        _bg = getattr(entry, "async_create_background_task", None)
+        if callable(_bg):
+            _bg(hass, _deferred_onboarding_wiring(), name="iems_onboarding_wiring")
+        else:  # pragma: no cover — HA core too old for background tasks
+            hass.async_create_task(_deferred_onboarding_wiring())
 
         # Sprint 5 Track B — Edge PoC: outage signal → light.living_lamp blue.
         # CEO directive 2026-05-01: blue (was amber Day 1-4).

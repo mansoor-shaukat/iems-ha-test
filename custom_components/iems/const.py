@@ -21,7 +21,17 @@ DOMAIN = "iems"
 # reconciles to cloud truth on reconnect via the /hacs/status pull.  No
 # wire-shape change to telemetry; gates WHETHER a batch publishes + WHICH
 # entities it carries.  Enforces "no telemetry until confirmed".
-VERSION = "0.4.0"
+# v0.4.1 (2026-06-04): BOOTSTRAP FIX. 0.4.0 wedged HA bootstrap — the batch +
+# heartbeat loops ran as FOREGROUND tasks (HA awaited them at the "wait for
+# platforms" stage → "Setup timed out for bootstrap waiting on" → supervisor
+# restart-loop), and the new setup-time cloud work (snapshot publish, command
+# subscribe, /hacs/status reconcile) was awaited synchronously on a possibly
+# slow/dead network. 0.4.1 moves the loops to entry.async_create_background_task
+# (HA does NOT await background tasks), defers the onboarding network work to a
+# background task, and puts a wait_for ceiling on credential exchange + IoT
+# connect so a hung cloud call surfaces as ConfigEntryNotReady (retry) instead
+# of wedging bootstrap. No wire-shape / FSM behavior change.
+VERSION = "0.4.1"
 
 # Config entry keys — stored in the HA config entry, never logged
 CONF_API_KEY = "api_key"
@@ -98,6 +108,15 @@ IEMS_AUTH_HTTP_TIMEOUT_SECONDS = 10
 # locked. The client degrades to None on 404/error so wiring it now is safe.
 IEMS_STATUS_URL = "https://mnrwhhjnuf.execute-api.eu-central-1.amazonaws.com/hacs-status"
 IEMS_STATUS_HTTP_TIMEOUT_SECONDS = 10
+
+# v0.4.1 (2026-06-04) — BOOTSTRAP-SAFETY ceiling on any cloud operation that
+# runs inside async_setup_entry (credential exchange + IoT connect, and the
+# deferred onboarding-wiring background task). A timeout here surfaces as
+# ConfigEntryNotReady so HA retries with backoff instead of wedging bootstrap
+# (the 0.4.0 supervisor restart-loop incident). Set slightly above the per-call
+# HTTP/MQTT timeouts (10s) so one internal retry can complete before this outer
+# ceiling trips.
+SETUP_CLOUD_OP_TIMEOUT_S = 12.0
 
 # Rate-limit backoff — per spec §7 Q4: 400/401 are permanent fails
 # (no retry); 429 uses 30s→10min exponential; 5xx uses uncapped

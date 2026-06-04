@@ -346,7 +346,23 @@ class IemsCloudAuthProvider:
             )
 
         def _call() -> dict[str, Any]:
-            client = boto3.client("cognito-identity", region_name=auth_response["region"])
+            # v0.4.1 (2026-06-04) — BOOTSTRAP FIX: bound the boto3 call. The
+            # default botocore connect/read timeout is 60s each with retries,
+            # so on a dead network this synchronous call (run via
+            # asyncio.to_thread) could block for minutes and wedge HA bootstrap.
+            # 10s connect / 10s read + 1 retry caps the worst case well under
+            # the SETUP_CLOUD_OP_TIMEOUT_S ceiling in __init__.
+            from botocore.config import Config as _BotoConfig  # local import
+            _cfg = _BotoConfig(
+                connect_timeout=10,
+                read_timeout=10,
+                retries={"max_attempts": 1},
+            )
+            client = boto3.client(
+                "cognito-identity",
+                region_name=auth_response["region"],
+                config=_cfg,
+            )
             return client.get_credentials_for_identity(
                 IdentityId=auth_response["identity_id"],
                 Logins={
