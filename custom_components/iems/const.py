@@ -31,7 +31,59 @@ DOMAIN = "iems"
 # background task, and puts a wait_for ceiling on credential exchange + IoT
 # connect so a hung cloud call surfaces as ConfigEntryNotReady (retry) instead
 # of wedging bootstrap. No wire-shape / FSM behavior change.
-VERSION = "0.4.1"
+# v0.4.2 (2026-06-04): fresh-user-walk fixes — (1) reauth flow in config_flow
+# (async_step_reauth/_confirm) so a rotated/revoked key re-prompts in place
+# instead of forcing delete+re-add; (2) connection BUILDER moved to an executor
+# (iot_core) so the awsiotsdk-METADATA filesystem reads stop tripping HA's
+# loop-protection "Detected blocking call" warning; (3) config-flow copy fix
+# "Account →" → "Settings →". No wire-shape / FSM / telemetry behavior change.
+# v0.4.3 (2026-06-05): REAUTH SAME-ACCOUNT FIX. v0.4.2's reauth guard set the
+# config-entry unique_id to a SHA-256 hash of the API KEY STRING, then asserted
+# the re-entered key produced the same unique_id. A rotated/re-minted key for
+# the SAME account is a different string → different hash → the same-account
+# assertion ALWAYS failed, so reauth could never succeed (and the old key was
+# already revoked). Fix: unique_id is now the RESOLVED ACCOUNT IDENTITY (Cognito
+# identity_id) — the new helper `resolve_account_identity()` exchanges the key
+# and returns the account it belongs to. A different KEY for the SAME account
+# resolves to the same identity → reauth passes; a DIFFERENT-account key → still
+# aborts (reauth_account_mismatch). Onboarding also resolves the identity now, so
+# duplicate-install prevention is account-scoped (not key-string-scoped) and a
+# revoked/garbage key is caught at the config-flow form (invalid_api_key /
+# auth_failed / cannot_connect) instead of failing later at setup. No wire-shape
+# / FSM / telemetry behavior change.
+# v0.4.4 (2026-06-05): REAUTH MIGRATION FIX. v0.4.3 switched the config-entry
+# unique_id from sha256(api_key)[:32] to the resolved Cognito identity_id, but
+# never migrated EXISTING entries. Every pre-0.4.3 install still stored the old
+# 32-hex hash (or a <=0.4.1 36-char UUID) — neither contains a colon, while an
+# identity_id always does. Reauth's same-account guard compared identity(new key)
+# vs the stored legacy hash → ALWAYS mismatched → "different account" abort on
+# every existing install, even with a correct same-account key. Two-part fix:
+# (1) setup-time heal in __init__ — when an entry loads with a legacy (no-colon)
+# unique_id and the stored key still exchanges OK, migrate unique_id to the
+# resolved identity_id (reusing the setup exchange, no extra network call), so a
+# valid-key install never reaches reauth. (2) reauth legacy-branch in config_flow
+# — when the stored unique_id is legacy (key already revoked, setup-heal never
+# ran), accept any VALID new key and migrate unique_id to its identity; the
+# one-way hash is not reversible to an identity so same-account can't be proven,
+# and it is the user's own reauth (SECURITY trade-off, legacy entries only). The
+# strict identity-format same-account abort is preserved unchanged. No wire-shape
+# / FSM / telemetry / payload behavior change.
+# v0.4.5 (2026-06-06): COLD-START LATENCY FIX. After config-entry setup the
+# batch + heartbeat loops slept their FULL steady-state interval (300s) BEFORE
+# the first iteration, so the first telemetry row and first heartbeat each
+# landed ~5 minutes after start (measured on staging: restart 19:04 → first DDB
+# row 19:09:47). Fix: the first iteration of each loop sleeps a short INITIAL_*
+# delay (telemetry ~12s, heartbeat ~5s); every SUBSEQUENT iteration reverts to
+# the unchanged 300s cadence. The first batch flush force-seals the current
+# partial minute (flush(seal_current_minute=True)) so it actually ships rows
+# instead of waiting for a natural minute boundary — that one cold-start row
+# legitimately carries fewer `samples`. The late-arrival guard was tightened
+# from strict `<` to `<=` so a force-sealed minute can NEVER be re-shipped by
+# the next (300s) flush. Steady-state cadence (BATCH_WINDOW_SECONDS /
+# HEARTBEAT_INTERVAL_SECONDS = 300s, cost/payload-tuned, CEO-locked) is
+# UNCHANGED. No wire-shape / payload-composition / FSM change; chunk cap stays
+# 200. SCHEMA_VERSION untouched.
+VERSION = "0.4.5"
 
 # Config entry keys — stored in the HA config entry, never logged
 CONF_API_KEY = "api_key"
@@ -59,6 +111,19 @@ API_KEY_REGEX = r"^iems_live_[0-9a-z]{26}$"
 # queue gets drained on the same tick.
 BATCH_WINDOW_SECONDS = 300
 HEARTBEAT_INTERVAL_SECONDS = 300
+
+# v0.4.5 (2026-06-06) — cold-start latency fix.  The FIRST iteration of each
+# background loop sleeps one of these short delays instead of the full
+# steady-state interval, so first telemetry/heartbeat lands in seconds rather
+# than ~5 minutes after coordinator.start().  Every SUBSEQUENT iteration reverts
+# to BATCH_WINDOW_SECONDS / HEARTBEAT_INTERVAL_SECONDS — steady-state cadence is
+# unchanged (cost/payload-tuned, CEO-locked).  Heartbeat fires first (5s) so the
+# liveness/version signal lands before the first data flush; the batch delay
+# (12s) gives newly-subscribed state_changed events a moment to populate the
+# current-minute accumulators before the force-sealed first flush ships them.
+INITIAL_HEARTBEAT_DELAY_SECONDS = 5
+INITIAL_FLUSH_DELAY_SECONDS = 12
+
 MAX_QUEUE_DEPTH = 10  # 10 batches @ 5min = 50 minutes of offline buffering
 MQTT_CONNECT_TIMEOUT_SECONDS = 10
 MQTT_PUBLISH_TIMEOUT_SECONDS = 10

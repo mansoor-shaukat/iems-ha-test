@@ -58,6 +58,7 @@ except ImportError:  # pragma: no cover - dev env
     _HA_AVAILABLE = False
 
 from .command_handler import CommandHandler
+from .config_flow import _is_legacy_unique_id
 from .const import COMMAND_TOPIC_TEMPLATE
 from .coordinator import IemsCoordinator
 from .edge_poc_outage import EdgePocOutageHandler, register_services, resolve_db_path
@@ -173,6 +174,27 @@ if _HA_AVAILABLE:
             "iems: auth OK; identity_id=%s... user_sub=%s... iot=%s region=%s",
             creds.identity_id[:16], creds.user_id[:8], creds.iot_endpoint, creds.region,
         )
+
+        # v0.4.4 (2026-06-05) — REAUTH MIGRATION: proactively heal a legacy
+        # config-entry unique_id while the stored key is still valid. Entries
+        # created <=0.4.2 store a sha256(api_key)[:32] hash (or a derived UUID
+        # on <=0.4.1); v0.4.3+ stores the resolved Cognito identity_id. We've
+        # just proved the key is valid (the exchange above succeeded), so reuse
+        # that SAME `creds.identity_id` — NO second network call — to migrate
+        # the unique_id in place. This means a valid-key install never has to
+        # hit the reauth flow's legacy branch at all; it self-heals on first
+        # 0.4.4 boot. Non-fatal by construction: if the key were revoked, the
+        # exchange above would already have raised ConfigEntryAuthFailed and we
+        # never reach here — and the reauth flow's legacy branch is the safety
+        # net for the revoked-key case (config_flow.async_step_reauth_confirm).
+        if _is_legacy_unique_id(entry.unique_id):
+            log.info(
+                "iems: migrating legacy config-entry unique_id to account "
+                "identity (v0.4.4 reauth-scheme heal)"
+            )
+            hass.config_entries.async_update_entry(
+                entry, unique_id=creds.identity_id
+            )
 
         # Build the MQTT adapter once we have real credentials.
         # NOTE: IotCorePublisher class currently lives in the monorepo

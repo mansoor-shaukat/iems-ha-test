@@ -64,6 +64,8 @@ from .const import (
     ENERGY_DELTA_THRESHOLD_KWH,
     HEARTBEAT_INTERVAL_SECONDS,
     HUMIDITY_DELTA_THRESHOLD_PCT,
+    INITIAL_FLUSH_DELAY_SECONDS,
+    INITIAL_HEARTBEAT_DELAY_SECONDS,
     MAX_ENTITIES_PER_BATCH_PUBLISH,
     SOC_DELTA_THRESHOLD_PCT,
     TELEMETRY_SUPPRESSED_MODES,
@@ -465,13 +467,25 @@ class IemsCoordinator:
         state = _coerce_state(raw_state, category)
         minute_iso = _minute_floor(ts)
 
-        # Defensive late-arrival guard: if we have already finalised a LATER
-        # minute for this entity, drop the event.  HA state ordering is
-        # monotonic in practice; this catches the rare clock-skew / replay case.
+        # Defensive late-arrival guard: if we have already finalised this
+        # entity's minute (or a LATER one), drop the event.  HA state ordering
+        # is monotonic in practice; this catches the rare clock-skew / replay
+        # case.
+        #
+        # v0.4.5: comparison is `<=`, not `<`.  The cold-start force-seal path
+        # (flush(seal_current_minute=True)) finalises the CURRENT partial
+        # minute M and records `_last_finalised_minute[entity]=M`.  With a
+        # strict `<` a fresh state_changed still inside minute M would equal
+        # last_final, slip past the guard, re-open a minute-M accumulator, and
+        # the next (300s) flush would ship a SECOND minute-M row for the same
+        # entity.  `<=` makes a force-sealed minute un-reopenable, so a sealed
+        # minute can never be double-shipped.  (This also tightens the ordinary
+        # late-arrival case: an event whose minute exactly equals an already
+        # finalised minute is genuinely stale and must be dropped.)
         last_final = self._last_finalised_minute.get(entity_id)
-        if last_final is not None and minute_iso < last_final:
+        if last_final is not None and minute_iso <= last_final:
             log.debug(
-                "drop late state_changed for %s: event_min=%s < last_finalised=%s",
+                "drop late state_changed for %s: event_min=%s <= last_finalised=%s",
                 entity_id, minute_iso, last_final,
             )
             return
@@ -638,6 +652,21 @@ class IemsCoordinator:
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc)
         return now.strftime("%Y-%m-%dT%H:%M:00Z")
+
+    def _next_minute_iso(self) -> str:
+        """Return the minute-floor ONE minute ahead of now (force-seal pivot).
+
+        v0.4.5 cold-start force-seal: passing this to
+        `_drain_finalised_rows(current_minute=...)` makes the drain treat the
+        current (still-open) minute as already sealed — every accumulator with
+        `minute_iso < next_minute` (i.e. including the current minute) finalises
+        and ships.  Used only by `flush(seal_current_minute=True)` on the very
+        first batch-loop iteration so the first telemetry row lands in seconds
+        instead of waiting for a natural minute boundary.
+        """
+        from datetime import datetime, timedelta, timezone
+        nxt = datetime.now(timezone.utc) + timedelta(minutes=1)
+        return nxt.strftime("%Y-%m-%dT%H:%M:00Z")
 
     def _drain_finalised_rows(self, *, current_minute: str | None = None) -> list[dict]:
         """Finalise accumulators whose minute < current_minute and return their rows.
@@ -954,8 +983,21 @@ class IemsCoordinator:
 
     # ---------------------- Flush + publish -------------------------------
 
-    async def flush(self) -> None:
+    async def flush(self, *, seal_current_minute: bool = False) -> None:
         """Finalise sealed-minute accumulators, build batch(es), ship them.
+
+        v0.4.5 cold-start fast-path: when `seal_current_minute=True` (the very
+        first batch-loop iteration after start), the CURRENT still-open minute
+        is force-sealed too — we drain against a pivot one minute AHEAD of now,
+        so the partial current-minute accumulators finalise and ship instead of
+        waiting for a natural minute boundary.  That one cold-start row
+        legitimately carries fewer `samples` (only the events seen in the first
+        ~12s) — an accepted trade-off for ~instant first data.  Because the
+        force-seal sets `_last_finalised_minute[entity]=<current minute>` and
+        the late-arrival guard in `_record_state` uses `<=`, that minute can
+        never be re-shipped by the next (steady-state) flush — no double-ship.
+        All non-first flushes pass `seal_current_minute=False` and behave
+        exactly as before.
 
         v0.2.1 (2026-05-26 hotfix): chunked publish. A 5-min flush window
         across many active entities can easily produce > 700 minute-rows,
@@ -986,7 +1028,10 @@ class IemsCoordinator:
             "%Y-%m-%dT%H:%M:%SZ"
         )
 
-        rows = self._drain_finalised_rows()
+        # v0.4.5: on the cold-start fast-path, pivot one minute ahead so the
+        # current partial minute is treated as sealed and ships now.
+        drain_pivot = self._next_minute_iso() if seal_current_minute else None
+        rows = self._drain_finalised_rows(current_minute=drain_pivot)
 
         # ---- Shipping-mode gate (#9, ADR 0005) --------------------------
         # setup / paused suppress the 30s telemetry batch path entirely:
@@ -1143,27 +1188,49 @@ class IemsCoordinator:
     # ---------------------- Background timers -----------------------------
 
     async def _batch_loop(self) -> None:
+        # v0.4.5 cold-start fix: the FIRST iteration sleeps a short delay and
+        # force-seals the current partial minute so first telemetry lands in
+        # ~12s; every subsequent iteration reverts to the unchanged 300s
+        # steady-state window.  `first` flips to False only after the first
+        # sleep returns, so the iteration-counter / flush semantics below are
+        # otherwise identical to pre-v0.4.5.
+        first = True
         while True:
             try:
-                await asyncio.sleep(BATCH_WINDOW_SECONDS)
+                await asyncio.sleep(
+                    INITIAL_FLUSH_DELAY_SECONDS if first else BATCH_WINDOW_SECONDS
+                )
                 # v0.2.2: tick the iteration counter AFTER the sleep returns
                 # so a value of 0 in the heartbeat unambiguously means
                 # "the loop never woke up" (task GC'd, never scheduled, etc.).
                 self._batch_loop_iterations += 1
-                await self.flush()
+                await self.flush(seal_current_minute=first)
+                first = False
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # pragma: no cover - safety net
+                # Even on a crashed first flush, revert to steady-state so a
+                # one-off cold-start failure can't pin the loop at the short
+                # delay forever.
+                first = False
                 log.error("batch flush crashed: %s: %s", type(exc).__name__, exc)
 
     async def _heartbeat_loop(self) -> None:
+        # v0.4.5 cold-start fix: first heartbeat fires after a short delay (~5s)
+        # so the liveness/version signal lands before the first data flush;
+        # subsequent ticks revert to the unchanged 300s interval.
+        first = True
         while True:
             try:
-                await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+                await asyncio.sleep(
+                    INITIAL_HEARTBEAT_DELAY_SECONDS if first else HEARTBEAT_INTERVAL_SECONDS
+                )
                 await self.heartbeat_once()
+                first = False
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # pragma: no cover
+                first = False
                 log.error("heartbeat crashed: %s: %s", type(exc).__name__, exc)
 
     async def start(self, entry: Any = None) -> None:

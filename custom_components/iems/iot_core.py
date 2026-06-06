@@ -16,6 +16,7 @@ All routing data flows from auth_provider.get_credentials().
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 from typing import Any
@@ -614,7 +615,19 @@ class IotCorePublisher:
         # happens within a single attempt.  v0.2.5 + v0.2.3 layer cleanly:
         # broker queue absorbs cross-reconnect publishes, retry loop
         # absorbs intra-flap publishes.
-        connection = mqtt_connection_builder.websockets_with_default_aws_signing(
+        # v0.4.2 (2026-06-04) — run the connection BUILDER in an executor.
+        # `websockets_with_default_aws_signing(...)` does synchronous filesystem
+        # reads (importlib.metadata listdir/read_text/open on the awsiotsdk
+        # package METADATA) while constructing the connection object.  Done on
+        # the HA event loop, HA's loop-protection flags it ("Detected blocking
+        # call ... iot_core.py").  It is pure object construction — no network
+        # (`.connect()` below is the network step) — so it is safe to hop onto a
+        # worker thread.  Per .claude/rules/hacs.md §Async discipline:
+        # loop.run_in_executor is the sanctioned off-loop primitive here
+        # (IotCorePublisher holds no `hass`, only the captured loop).
+        loop = asyncio.get_event_loop()
+        _build_connection = functools.partial(
+            mqtt_connection_builder.websockets_with_default_aws_signing,
             endpoint=creds.iot_endpoint,
             region=creds.region,
             credentials_provider=credentials_provider,
@@ -625,8 +638,8 @@ class IotCorePublisher:
             on_connection_interrupted=_on_interrupted,
             on_connection_resumed=_on_resumed,
         )
+        connection = await loop.run_in_executor(None, _build_connection)
 
-        loop = asyncio.get_event_loop()
         connect_future = connection.connect()
         await asyncio.wait_for(
             loop.run_in_executor(None, connect_future.result),
