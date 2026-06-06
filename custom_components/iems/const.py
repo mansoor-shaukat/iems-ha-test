@@ -83,7 +83,23 @@ DOMAIN = "iems"
 # HEARTBEAT_INTERVAL_SECONDS = 300s, cost/payload-tuned, CEO-locked) is
 # UNCHANGED. No wire-shape / payload-composition / FSM change; chunk cap stays
 # 200. SCHEMA_VERSION untouched.
-VERSION = "0.4.5"
+# v0.4.6 (2026-06-06): DATA-RECOVERY "real HA check" (Sprint 7). New
+# `recover_window` command on the EXISTING command down-topic: HACS queries HA's
+# LOCAL recorder in-process (recorder.get_instance(hass).async_add_executor_job +
+# history.get_significant_states — NO HA REST token, runs on the recorder
+# executor thread so the event loop never blocks) for [start_ts, end_ts), replays
+# the found rows through the production telemetry publish path (same classifier +
+# build_batch + 200-row chunk cap + 128 KiB guard as steady-state, so the gap
+# backfills with byte-identical wire format), and acks the truth HA returned on
+# the heartbeat via a new nullable `last_recovery` field
+# {window_id,start_ts,end_ts,result,rows_found,rows_published,completed_at}.
+# result=no_data when the recorder returns zero rows (genuine HA-had-nothing) —
+# this is how the cloud learns recoverability instead of guessing from duration.
+# Recovery runs OFF the steady-state path: it never touches the per-minute
+# accumulators, the 300s flush cadence, or the 0.4.5 cold-start fast-flush.
+# Heartbeat schema_version unchanged (last_recovery is additive + nullable);
+# telemetry wire-shape / chunk cap (200) / FSM all UNCHANGED.
+VERSION = "0.4.6"
 
 # Config entry keys — stored in the HA config entry, never logged
 CONF_API_KEY = "api_key"
@@ -237,6 +253,13 @@ DEFAULT_SHIPPING_MODE = SHIPPING_MODE_SETUP
 # Command actions on the down-topic (contracts/mqtt_topics.md §command).
 COMMAND_ACTION_SET_SHIPPING_MODE = "set_shipping_mode"
 COMMAND_ACTION_TAKE_SETUP_SNAPSHOT = "take_setup_snapshot"
+# v0.4.6 (2026-06-06) — Data-recovery "real HA check" (Sprint 7).
+# Cloud sends recover_window on the existing command down-topic; HACS queries
+# HA's local recorder in-process for [start_ts, end_ts), replays the found rows
+# via the normal telemetry publish path, and acks the truth on the heartbeat
+# `last_recovery` field. NO new MQTT topic, NO IAM change.
+# See docs/sprints/sprint_07/data_recovery_real_ha_check_spec.md.
+COMMAND_ACTION_RECOVER_WINDOW = "recover_window"
 
 # Schema — MUST match server-side ingestion validator version
 SCHEMA_VERSION = "0.6.0"

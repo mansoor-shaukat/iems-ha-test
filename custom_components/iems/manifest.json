@@ -1,7 +1,7 @@
 {
   "domain": "iems",
   "name": "iEMS",
-  "version": "0.4.5",
+  "version": "0.4.6",
   "documentation": "https://github.com/mansoor-shaukat/iems-ha-integration",
   "issue_tracker": "https://github.com/mansoor-shaukat/iems-ha-integration/issues",
   "codeowners": ["@mansoor-shaukat"],
@@ -14,5 +14,5 @@
     "boto3>=1.34,<2",
     "awsiotsdk>=1.21,<2"
   ],
-  "dependencies": []
+  "dependencies": ["recorder"]
 }

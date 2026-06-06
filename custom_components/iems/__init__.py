@@ -63,6 +63,7 @@ from .const import COMMAND_TOPIC_TEMPLATE
 from .coordinator import IemsCoordinator
 from .edge_poc_outage import EdgePocOutageHandler, register_services, resolve_db_path
 from .publisher import TelemetryPublisher
+from .recovery import RecoveryManager
 from .snapshot import SetupSnapshotManager, collect_setup_snapshot
 from .status_client import HacsStatusClient
 
@@ -277,9 +278,24 @@ if _HA_AVAILABLE:
         # gates the 30s telemetry path on shipping_mode; first install starts
         # in `setup` so NO telemetry flows until the cloud commands `active`
         # after the user confirms the site_model in the wizard.
+        # Data-recovery (#?, Sprint 7) — in-process recorder replay for a gap
+        # window.  The cloud sends `recover_window` on the SAME command
+        # down-topic; HACS queries HA's local recorder, replays the found rows
+        # through the publisher, and acks the truth on the heartbeat
+        # (coordinator.set_last_recovery → build_heartbeat last_recovery).  Runs
+        # off the steady-state telemetry path (recorder executor thread); no new
+        # MQTT topic, no IAM change.
+        recovery_manager = RecoveryManager(
+            hass=hass,
+            user_id=creds.identity_id,
+            entity_index=entity_index,
+            publisher=publisher,
+            set_last_recovery=coordinator.set_last_recovery,
+        )
         command_handler = CommandHandler(
             coordinator=coordinator,
             snapshot_manager=snapshot_manager,
+            recovery_manager=recovery_manager,
         )
         status_client = HacsStatusClient(api_key=api_key)
         command_topic = COMMAND_TOPIC_TEMPLATE.format(user_id=creds.identity_id)
@@ -400,6 +416,8 @@ if _HA_AVAILABLE:
             # Onboarding v2 (#9) — shipping-mode command channel.
             "command_handler": command_handler,
             "status_client": status_client,
+            # Data-recovery (Sprint 7) — recover_window recorder replay.
+            "recovery_manager": recovery_manager,
         }
         return True
 

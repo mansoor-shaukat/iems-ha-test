@@ -216,6 +216,7 @@ def build_heartbeat(
     payload_too_large_count: int | None = None,
     client_error_disconnects: int | None = None,
     last_disconnect_reason: str | None = None,
+    last_recovery: dict | None = None,
 ) -> dict:
     """Heartbeat payload — shape per hacs_spec.md §3f.
 
@@ -278,4 +279,14 @@ def build_heartbeat(
         payload["client_error_disconnects"] = int(client_error_disconnects)
     if last_disconnect_reason is not None:
         payload["last_disconnect_reason"] = str(last_disconnect_reason)
+    # v0.4.6 (2026-06-06) — data-recovery ack (Sprint 7).  Additive + nullable:
+    # the cloud's heartbeat-consumer persists this onto the gap's
+    # recovery_status / rows_found.  Shape per
+    # docs/sprints/sprint_07/data_recovery_real_ha_check_spec.md §"Up ack":
+    #   {window_id, start_ts, end_ts, result, rows_found, rows_published,
+    #    completed_at}.  Emitted only when a recover attempt has run (None means
+    # "no recover_window since start" — field omitted, heartbeat schema
+    # otherwise UNCHANGED so older consumers are unaffected).
+    if last_recovery is not None:
+        payload["last_recovery"] = last_recovery
     return payload

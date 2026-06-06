@@ -11,6 +11,11 @@ subscribe callback and the coordinator/snapshot FSM:
     {"action": "take_setup_snapshot"}
         -> snapshot_manager.handle_take_setup_snapshot_command()   (any mode)
 
+    {"action": "recover_window", "window_id": "...", "start_ts": "...Z",
+     "end_ts": "...Z"}
+        -> recovery_manager.recover_window(window_id=..., start_ts=...,
+                                           end_ts=...)              (any mode)
+
 Design — pure decode + thin dispatch
 ------------------------------------
 `decode_command` is a pure bytes/str → dict parser (raises InvalidCommandError
@@ -28,6 +33,7 @@ import logging
 from typing import Any
 
 from .const import (
+    COMMAND_ACTION_RECOVER_WINDOW,
     COMMAND_ACTION_SET_SHIPPING_MODE,
     COMMAND_ACTION_TAKE_SETUP_SNAPSHOT,
 )
@@ -72,11 +78,16 @@ class CommandHandler:
       - `coordinator` — exposes `set_shipping_mode(mode, *, whitelist,
         whitelist_version)` (sync).
       - `snapshot_manager` — exposes `async handle_take_setup_snapshot_command()`.
+      - `recovery_manager` — optional; exposes
+        `async recover_window(*, window_id, start_ts, end_ts)`.  None when the
+        recovery feature isn't wired (a `recover_window` command then logs +
+        drops as un-dispatchable, never crashing the callback).
     """
 
-    def __init__(self, *, coordinator, snapshot_manager) -> None:
+    def __init__(self, *, coordinator, snapshot_manager, recovery_manager=None) -> None:
         self._coordinator = coordinator
         self._snapshot_manager = snapshot_manager
+        self._recovery_manager = recovery_manager
 
     async def handle_command(self, command: dict[str, Any]) -> None:
         """Dispatch a decoded command dict. Raises InvalidCommandError on error."""
@@ -85,6 +96,8 @@ class CommandHandler:
             await self._handle_set_shipping_mode(command)
         elif action == COMMAND_ACTION_TAKE_SETUP_SNAPSHOT:
             await self._handle_take_setup_snapshot(command)
+        elif action == COMMAND_ACTION_RECOVER_WINDOW:
+            await self._handle_recover_window(command)
         elif action is None:
             raise InvalidCommandError("command missing 'action'")
         else:
@@ -111,6 +124,41 @@ class CommandHandler:
         # (AC #3): the snapshot is the one payload that flows pre-confirmation,
         # and a user-triggered re-scan must work even after going active.
         await self._snapshot_manager.handle_take_setup_snapshot_command()
+
+    async def _handle_recover_window(self, command: dict[str, Any]) -> None:
+        """Dispatch a `recover_window` command to the recovery manager.
+
+        Validates the three required string fields BEFORE touching the
+        recorder.  A missing/blank field raises InvalidCommandError so the
+        on_message wrapper logs + drops it — the recover action never crashes
+        the callback.
+
+        The recover itself runs OFF the steady-state telemetry path: it queries
+        HA's recorder on the recorder executor thread (never the event loop) and
+        replays through the publisher.  We AWAIT the manager here — the manager's
+        own internal work is non-blocking (executor-offloaded), and the manager
+        is contractually no-raise (it captures every failure as an `error` ack),
+        so awaiting it cannot break the callback invariant.
+        """
+        if self._recovery_manager is None:
+            raise InvalidCommandError(
+                "recover_window received but no recovery_manager is wired"
+            )
+        window_id = command.get("window_id")
+        start_ts = command.get("start_ts")
+        end_ts = command.get("end_ts")
+        for field, value in (
+            ("window_id", window_id),
+            ("start_ts", start_ts),
+            ("end_ts", end_ts),
+        ):
+            if not isinstance(value, str) or not value.strip():
+                raise InvalidCommandError(
+                    f"recover_window missing/invalid {field!r}"
+                )
+        await self._recovery_manager.recover_window(
+            window_id=window_id, start_ts=start_ts, end_ts=end_ts
+        )
 
     async def on_message(self, raw: bytes | str | dict) -> bool:
         """awscrt-callback-facing entry point: decode + dispatch, never raises.

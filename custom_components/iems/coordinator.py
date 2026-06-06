@@ -402,6 +402,15 @@ class IemsCoordinator:
         #   "no publish errors since start".
         self._last_publish_error: str | None = None
 
+        # ---- v0.4.6 data-recovery ack (Sprint 7) ------------------------
+        # The most-recent `recover_window` outcome, surfaced on the heartbeat
+        # so the cloud learns whether HA's recorder actually had the gap rows.
+        # None until the first recover attempt completes.  Shape per
+        # docs/sprints/sprint_07/data_recovery_real_ha_check_spec.md:
+        #   {window_id, start_ts, end_ts, result, rows_found, rows_published,
+        #    completed_at}.  Additive + nullable — heartbeat schema unchanged.
+        self._last_recovery: dict[str, Any] | None = None
+
     # ---------------------- State capture ---------------------------------
 
     def capture_state_change(self, new_state) -> None:
@@ -966,6 +975,16 @@ class IemsCoordinator:
                 whitelist, whitelist_version=status.get("whitelist_version")
             )
 
+    def set_last_recovery(self, ack: dict[str, Any]) -> None:
+        """Stash the most-recent recover_window ack for the next heartbeat.
+
+        Called by RecoveryManager after a recover attempt completes (v0.4.6,
+        Sprint 7).  Pure state write — the value is read by `heartbeat_once`
+        and shipped on the heartbeat's `last_recovery` field so the cloud
+        learns whether HA's recorder had the gap rows.
+        """
+        self._last_recovery = ack
+
     def _telemetry_publishing_enabled(self) -> bool:
         """True iff the current shipping mode permits 30s telemetry batches."""
         return self.shipping_mode not in TELEMETRY_SUPPRESSED_MODES
@@ -1170,6 +1189,10 @@ class IemsCoordinator:
             payload_too_large_count=payload_too_large_count,
             client_error_disconnects=client_error_disconnects,
             last_disconnect_reason=last_disconnect_reason,
+            # v0.4.6 — data-recovery ack.  None until the first recover_window
+            # completes; once set, every heartbeat re-reports the latest
+            # outcome so a missed heartbeat doesn't lose the ack.
+            last_recovery=self._last_recovery,
         )
         await self._publisher.publish_heartbeat(hb)
         # Drain any backlogged batches the publisher accumulated while the
