@@ -119,7 +119,25 @@ DOMAIN = "iems"
 # -> "Data unrecoverable"); a static-entity boundary state can never force
 # "recovered". Recovery still runs OFF the steady-state path. No wire-shape /
 # payload-composition / chunk-cap (200) / FSM / SCHEMA_VERSION change.
-VERSION = "0.4.8"
+# v0.4.9 (2026-06-10): SETUP-SNAPSHOT entity_classifications (onboarding, issue
+# #4 follow-up / #20). The setup snapshot now carries a top-level
+# entity_classifications[] ({entity_id, category, friendly_name}) classified
+# from the SAME entity_index + classifier.classify the telemetry whitelist uses
+# (energy categories only — inverter.{pv,grid,load,battery}, battery.soc,
+# meter.energy, sensor.{power,energy}; `other`/controllable/environment dropped
+# to stay lean under the 128 KiB IoT limit, capped at 350 with a logged drop —
+# worst-case full snapshot measured at ~95 KiB, ~36 KiB under the hard limit).
+# Fixes a real fresh-user onboarding (CEO's home, 2026-06-10) that produced an
+# EMPTY site model: the snapshot carried only ha_energy_prefs (EMPTY without a
+# configured HA Energy Dashboard) + device-level device_registry_snapshot (no
+# entity IDs), so the cloud Stage-2 classifier's energy-prefs + entity-keyword
+# tiers were both empty → device-registry shape-only inference → correct shape,
+# ZERO entities. The cloud classifier already reads entity_classifications[]
+# (site_model_classifier handler.py Tier-2); HACS just never sent it. Setup
+# snapshot is a distinct pre-confirmation payload — NO telemetry wire-shape /
+# SCHEMA_VERSION (telemetry stays 0.6.0; snapshot stays contract const 0.13.0) /
+# chunk-cap (200) / FSM change. Only the setup-topic payload composition grows.
+VERSION = "0.4.9"
 
 # Config entry keys — stored in the HA config entry, never logged
 CONF_API_KEY = "api_key"

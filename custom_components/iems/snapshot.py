@@ -7,20 +7,42 @@ install and once per `take_setup_snapshot` command. The cloud receiver Lambda
 writes it onto `PROFILE#SITE_MODEL` with `status='draft'`; Stage-2 (#6) and
 Stage-3 (#8) classifiers consume it from there.
 
-Contract: `contracts/setup_snapshot.schema.json` (v0.13.0, CTO-owned, read-only).
+Contract: `contracts/setup_snapshot.schema.json` (rev v0.13.1, CTO-owned,
+read-only). NOTE: the contract's `schema_version` *const* is pinned at "0.13.0"
+even though the document revision is v0.13.1 — the v0.13.1 change (the optional
+top-level `entity_classifications[]` field) is ADDITIVE, so a pre-collector
+0.13.0 snapshot still validates. The wire `schema_version` therefore stays
+"0.13.0"; the drift guard enforces it.
 
 Design — pure core + thin impure shell
 --------------------------------------
 `build_setup_snapshot` is PURE, deterministic, side-effect-free: every input is
-passed in (config dict, energy_prefs, device list, ts string), the output is the
-fixed JSON shape. No HA APIs, no clock, no uuid, no I/O. This matches the
-`classifier.classify` test pattern and makes the mutate-flips-output acceptance
-test trivial.
+passed in (config dict, energy_prefs, device list, entity_index, ts string), the
+output is the fixed JSON shape. No HA APIs, no clock, no uuid, no I/O. This
+matches the `classifier.classify` test pattern and makes the mutate-flips-output
+acceptance test trivial.
 
 `collect_setup_snapshot(hass, ...)` is the thin impure shell that extracts the
-three inputs from a live HA instance (`hass.config`, the HA `energy/get_prefs`
-WS result, the device registry) and delegates to the pure builder. The WS call
-and registry walk live there so the pure path stays testable with plain dicts.
+inputs from a live HA instance (`hass.config`, the HA `energy/get_prefs` WS
+result, the device registry) and delegates to the pure builder. The WS call and
+registry walk live there so the pure path stays testable with plain dicts. The
+already-built `entity_index` (the same per-entity registry snapshot the
+coordinator classifies for telemetry) is passed IN by the caller — the shell
+does not rebuild it.
+
+Why entity_classifications matters (CEO fresh-user-walk, 2026-06-10)
+-------------------------------------------------------------------
+A real fresh-user onboarding produced an EMPTY site model (no pv/grid/load/
+battery entities) even though the home has 4 Deye inverters publishing
+telemetry. Root cause: the snapshot carried only `ha_energy_prefs` (EMPTY when
+the user hasn't configured HA's Energy Dashboard — the common case) plus a
+device-level `device_registry_snapshot` (no entity IDs). The cloud Stage-2
+classifier's energy-prefs tier was empty, its entity-keyword tier had no
+entities, and it fell to device-registry shape-only inference → correct shape,
+ZERO entities → onboarding had nothing to show. The cloud classifier ALREADY
+reads a top-level `entity_classifications[]` (handler.py `classify()` Tier-2);
+HACS just never sent it. This module now emits it, reusing the SAME
+`classifier.classify` HACS runs for the telemetry whitelist.
 """
 from __future__ import annotations
 
@@ -28,12 +50,63 @@ import inspect
 import logging
 from typing import Any, Callable
 
+from .classifier import classify
+
 log = logging.getLogger("iems.snapshot")
 
-# Pinned to the contract `const`. The drift guard in
+# Pinned to the contract `const` ("0.13.0", NOT the v0.13.1 doc revision — see
+# the module docstring). The drift guard in
 # tests/hacs/test_snapshot.py::test_snapshot_schema_version_matches_contract
 # fails loudly if this diverges from contracts/setup_snapshot.schema.json.
 SCHEMA_VERSION = "0.13.0"
+
+# Categories that are ENERGY-relevant for the cloud Stage-2 site-model
+# classifier. These are the categories its `_CATEGORY_TO_BUCKET` buckets
+# directly (inverter.{pv,grid,battery,load}, battery.soc, meter.energy) PLUS the
+# generic power/energy sensors whose entity_id keywords (`solar`, `grid`,
+# `load`, `consumption`, ...) feed its `_KEYWORD_TO_BUCKET` fallback. We emit
+# ONLY these to keep the pre-confirmation payload lean: controllables
+# (switch/light/climate), environment (temperature/humidity) and `other` carry
+# no site-model signal and would only inflate the snapshot toward the 128 KiB
+# IoT limit. Mirrors classifier.VALID_CATEGORIES minus the non-energy members.
+_ENERGY_CATEGORIES: frozenset[str] = frozenset(
+    {
+        "inverter.pv",
+        "inverter.grid",
+        "inverter.load",
+        "inverter.battery",
+        "battery.soc",
+        "meter.energy",
+        "sensor.power",
+        "sensor.energy",
+    }
+)
+
+# Hard ceiling on entity_classifications[] entries so a pathological install
+# (thousands of power sensors) can't push the setup payload past the 128 KiB
+# IoT Core limit (MQTT_MESSAGE_SIZE_HARD_LIMIT_BYTES). The setup snapshot is
+# published via iot_core.publish, which RAISES PayloadTooLargeError on any
+# payload > 131072 bytes — i.e. an oversized snapshot doesn't truncate, it FAILS
+# WHOLESALE and onboarding gets nothing. So this cap must keep the COMPLETE
+# snapshot (site_config + device_registry_snapshot + entity_classifications)
+# under the limit with the hacs.md ≥35% headroom margin (≤ 80% × 128 KiB ≈ 104
+# KiB target).
+#
+# Sizing (MEASURED worst case: 350 maximally-long entity names + a 181-device
+# registry of maximally-long manufacturer/model strings — far heavier than any
+# real home):
+#   - 350 classifications × ~168 B               ≈ 58 KiB
+#   - device_registry_snapshot, 181 heavy devices ≈ 36 KiB (≥ CEO's home)
+#   - site_config + envelope                      ≈  1 KiB
+#   - WORST-CASE TOTAL                            ≈ 95.4 KiB  (under the ~104 KiB
+#                                                   80%-headroom target, ~36 KiB
+#                                                   below the 128 KiB hard limit)
+# Realistic homes are far smaller: CEO's home surfaces ~146 entities TOTAL, of
+# which a minority are energy-category → a ~16 KiB snapshot. 350 is a defensive
+# ceiling well above any real energy-entity count while still guaranteeing the
+# publish can't trip PayloadTooLargeError. Dropped entities are logged loudly —
+# never silently truncated.
+_MAX_ENTITY_CLASSIFICATIONS: int = 350
 
 # Per the contract: site_config.additionalProperties = false. We lift EXACTLY
 # these keys from hass.config (currency_from_locale is derived from HA currency)
@@ -71,6 +144,79 @@ def _project(src: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
     return {k: src[k] for k in keys if k in src}
 
 
+def _build_entity_classifications(
+    entity_index: dict[str, dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """Classify each entity in `entity_index` and emit the energy-relevant set.
+
+    PURE (no I/O, no HA). Reuses `classifier.classify` — the SAME classifier
+    HACS runs per-entity for the telemetry whitelist — so the categories the
+    cloud sees in the snapshot are identical to the categories it sees on the
+    wire. We do NOT re-implement classification.
+
+    Output item shape (matches the cloud consumer
+    `infra/lambdas/site_model_classifier/handler.py` `classify()` Tier-2 and the
+    contract's `entity_classifications.items`):
+
+        {"entity_id": str, "category": str, "friendly_name": str | None}
+
+    Only entities whose classified category is in `_ENERGY_CATEGORIES` are
+    emitted — `other`, controllables and environment sensors carry no
+    site-model signal and are dropped to keep the payload lean. Results are
+    sorted by entity_id for deterministic output. If more than
+    `_MAX_ENTITY_CLASSIFICATIONS` energy entities classify, the list is capped
+    (after sort) and the drop is logged loudly — never silently truncated.
+
+    `entity_index` is the coordinator's per-entity registry snapshot keyed by
+    entity_id, each value `{platform, domain, device_class, unit, name, area,
+    brand, consumer_device}` (see __init__._build_entity_index). `None` (no
+    index supplied) yields an empty list — a back-compat path for callers that
+    predate the entity_index wiring.
+    """
+    if not entity_index:
+        return []
+
+    classified: list[dict[str, Any]] = []
+    for entity_id, meta in entity_index.items():
+        # classify() mutates+returns its input dict — pass a shallow copy with
+        # entity_id injected so we never mutate the coordinator's live index.
+        candidate = dict(meta)
+        candidate["entity_id"] = entity_id
+        result = classify(candidate)
+        if not result.get("surface"):
+            continue
+        category = result.get("category")
+        if category not in _ENERGY_CATEGORIES:
+            continue
+        classified.append(
+            {
+                "entity_id": entity_id,
+                "category": category,
+                # friendly name from the registry-index `name`; classify()
+                # falls back to entity_id internally for its own matching, but
+                # for the snapshot we surface the human-friendly name (nullable
+                # per the contract) so the wizard can label ambiguous entities.
+                "friendly_name": meta.get("name"),
+            }
+        )
+
+    classified.sort(key=lambda item: item["entity_id"])
+
+    if len(classified) > _MAX_ENTITY_CLASSIFICATIONS:
+        dropped = len(classified) - _MAX_ENTITY_CLASSIFICATIONS
+        log.warning(
+            "setup snapshot: %d energy entities classified, capping "
+            "entity_classifications at %d (dropping %d) to stay under the "
+            "128 KiB IoT payload limit",
+            len(classified),
+            _MAX_ENTITY_CLASSIFICATIONS,
+            dropped,
+        )
+        classified = classified[:_MAX_ENTITY_CLASSIFICATIONS]
+
+    return classified
+
+
 def build_setup_snapshot(
     *,
     user_id: str,
@@ -79,6 +225,7 @@ def build_setup_snapshot(
     devices: list[dict[str, Any]],
     source_kind: str,
     ts: str,
+    entity_index: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build a `setup_snapshot.schema.json`-conforming payload. PURE.
 
@@ -103,11 +250,20 @@ def build_setup_snapshot(
         first-install capture from a user-triggered re-scan.
     ts
         ISO-8601 UTC capture time; MUST end in 'Z' (contract pattern Z$).
+    entity_index
+        The coordinator's per-entity registry snapshot keyed by entity_id (the
+        SAME structure classified for the telemetry whitelist). Each value is
+        `{platform, domain, device_class, unit, name, ...}`. Used to build the
+        top-level `entity_classifications[]` (energy-relevant entities only) via
+        `classifier.classify`. `None` (omitted) emits an empty list — a
+        back-compat path. This is the field whose absence produced an EMPTY
+        onboarding for the CEO's real home (no Energy Dashboard configured) on
+        2026-06-10; see module docstring.
 
     Returns
     -------
     dict
-        The snapshot payload. Determinstic for fixed inputs — no clock, no
+        The snapshot payload. Deterministic for fixed inputs — no clock, no
         uuid, no I/O. Does not mutate any input.
 
     Raises
@@ -125,6 +281,7 @@ def build_setup_snapshot(
 
     site_config = _project(config, _SITE_CONFIG_KEYS)
     device_registry_snapshot = [_project(d, _DEVICE_KEYS) for d in devices]
+    entity_classifications = _build_entity_classifications(entity_index)
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -136,6 +293,12 @@ def build_setup_snapshot(
         # parses flow_from/flow_to/solar/battery selections as ground truth.
         "ha_energy_prefs": energy_prefs,
         "device_registry_snapshot": device_registry_snapshot,
+        # Top-level per-entity classifier output (contract v0.13.1). REQUIRED
+        # input for the cloud Stage-2 category+keyword fallback when
+        # ha_energy_prefs is empty — without it a real fresh user gets an EMPTY
+        # site model. Energy-relevant categories only; see
+        # _build_entity_classifications.
+        "entity_classifications": entity_classifications,
     }
 
 
@@ -315,6 +478,7 @@ async def collect_setup_snapshot(
     *,
     user_id: str,
     source_kind: str,
+    entity_index: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Impure shell: gather inputs from a live HA instance + build the snapshot.
 
@@ -322,6 +486,13 @@ async def collect_setup_snapshot(
     registry, then delegates to the PURE `build_setup_snapshot`. The clock read
     for `ts` happens HERE (the impure boundary) so the pure builder stays
     deterministic.
+
+    `entity_index` is the already-built per-entity registry snapshot the caller
+    (`__init__.async_setup_entry`) constructs once via `_build_entity_index` and
+    passes to the coordinator. We thread it through so the snapshot's
+    `entity_classifications[]` is classified from the SAME index the telemetry
+    whitelist uses — no second registry walk, no drift. `None` (not supplied)
+    emits an empty `entity_classifications[]`.
     """
     from datetime import datetime, timezone
 
@@ -336,4 +507,5 @@ async def collect_setup_snapshot(
         devices=devices,
         source_kind=source_kind,
         ts=ts,
+        entity_index=entity_index,
     )

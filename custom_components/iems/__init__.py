@@ -261,9 +261,17 @@ if _HA_AVAILABLE:
         # this one; this dispatch only wires the snapshot publish path.
         def _collect(source_kind: str):
             # Returns a coroutine; SetupSnapshotManager awaits awaitable
-            # collectors (see _collect_snapshot).
+            # collectors (see _collect_snapshot). Pass the already-built
+            # entity_index so the snapshot's entity_classifications[] is
+            # classified from the SAME per-entity registry the telemetry
+            # whitelist uses (no second registry walk). Without this, a real
+            # fresh user with no HA Energy Dashboard configured gets an EMPTY
+            # cloud site model (CEO walk, 2026-06-10).
             return collect_setup_snapshot(
-                hass, user_id=creds.identity_id, source_kind=source_kind,
+                hass,
+                user_id=creds.identity_id,
+                source_kind=source_kind,
+                entity_index=entity_index,
             )
 
         snapshot_manager = SetupSnapshotManager(
