@@ -137,7 +137,7 @@ DOMAIN = "iems"
 # snapshot is a distinct pre-confirmation payload — NO telemetry wire-shape /
 # SCHEMA_VERSION (telemetry stays 0.6.0; snapshot stays contract const 0.13.0) /
 # chunk-cap (200) / FSM change. Only the setup-topic payload composition grows.
-VERSION = "0.4.9"
+VERSION = "0.5.0"
 
 # Config entry keys — stored in the HA config entry, never logged
 CONF_API_KEY = "api_key"

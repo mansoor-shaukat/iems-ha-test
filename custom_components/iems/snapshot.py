@@ -124,6 +124,7 @@ _SITE_CONFIG_KEYS: tuple[str, ...] = (
 # optional; manufacturer/model/integration_domain are required (nullable).
 _DEVICE_KEYS: tuple[str, ...] = (
     "device_id",
+    "name",
     "manufacturer",
     "model",
     "sw_version",
@@ -439,6 +440,11 @@ def _extract_devices(hass) -> list[dict[str, Any]]:
         out.append(
             {
                 "device_id": entry.id,
+                # User-facing device name: the user's rename wins, else HA's default
+                # name. This is what the SmartHome "what else we found" scene labels
+                # devices with (mtronic devices carry no model, so without this the
+                # list rendered empty). Nullable per the contract.
+                "name": entry.name_by_user or entry.name,
                 "manufacturer": entry.manufacturer,
                 "model": entry.model,
                 "sw_version": entry.sw_version,
