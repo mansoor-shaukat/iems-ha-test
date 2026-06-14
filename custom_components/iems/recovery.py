@@ -73,6 +73,7 @@ from typing import Any, Callable
 
 from .classifier import classify
 from .const import MAX_ENTITIES_PER_BATCH_PUBLISH
+from .coordinator import _MinuteAccumulator, _minute_floor
 from .telemetry import EmptyBatchError, build_batch
 
 log = logging.getLogger("iems.recovery")
@@ -311,6 +312,49 @@ class RecoveryManager:
         self._set_last_recovery = set_last_recovery
         self._query_recorder = query_recorder or _query_recorder
 
+    @staticmethod
+    def _fold_into_accumulator(
+        accumulators: dict[tuple[str, str], _MinuteAccumulator],
+        item: dict[str, Any],
+    ) -> None:
+        """Fold one classified+captured row into its (entity_id, minute) accumulator.
+
+        Mirrors `IemsCoordinator.capture_state_change`'s numeric/passthrough
+        fork so a recovered minute-row is byte-identical to a live one:
+          - numeric categories (state already coerced to float by
+            `_classify_and_capture`/`_coerce_state`) fold via sum/count/min/max;
+            `finalise()` emits state=mean, min, max, samples=count.
+          - non-numeric categories use latest-wins passthrough; `finalise()`
+            emits state=latest, samples=count, no min/max.
+        `bool` is excluded from the numeric path explicitly (bool subclasses int)
+        so a boolean-ish state never gets summed — same guard as the coordinator.
+        """
+        entity_id = item["entity_id"]
+        category = item["category"]
+        minute_iso = _minute_floor(item["ts"])
+        key = (entity_id, minute_iso)
+        acc = accumulators.get(key)
+        if acc is None:
+            acc = _MinuteAccumulator(
+                entity_id=entity_id,
+                category=category,
+                minute_iso=minute_iso,
+                brand=item.get("brand"),
+                area=item.get("area"),
+                unit=item.get("unit"),
+            )
+            accumulators[key] = acc
+
+        state = item["state"]
+        if (
+            category in _NUMERIC_CATEGORIES
+            and isinstance(state, (int, float))
+            and not isinstance(state, bool)
+        ):
+            acc.update_numeric(float(state))
+        else:
+            acc.update_passthrough(state)
+
     def _surfacing_entity_ids(self) -> list[str]:
         """The entity whitelist to pull history for — exactly what HACS surfaces.
 
@@ -386,7 +430,7 @@ class RecoveryManager:
                 detail=f"recorder query failed: {type(exc).__name__}",
             )
 
-        # --- Classify + capture the found rows ------------------------------
+        # --- Classify + per-minute AGGREGATE the found rows -----------------
         # CRITICAL (recover_false_success_2026-06-07): the recorder query uses
         # include_start_time_state=True, so for a window where HA has NOTHING
         # inside [start_dt, end_dt) it STILL returns one carried-forward
@@ -397,9 +441,28 @@ class RecoveryManager:
         # "recovered" off a single boundary row.  So: a row counts as GENUINE
         # only when start_dt <= last_changed < end_dt (datetime compare, not the
         # ISO string).  Boundary states (last_changed < start_dt) are excluded
-        # from rows_found AND from the captured/published set.
-        captured: list[dict] = []
-        rows_found = 0  # GENUINE in-window rows only (excludes boundary states)
+        # from rows_found AND from the aggregated/published set.
+        #
+        # PER-MINUTE AGGREGATION (Task 1, 2026-06-14): instead of emitting one
+        # telemetry row per raw recorder state-change, we fold genuine in-window
+        # rows into the coordinator's `_MinuteAccumulator` keyed by
+        # (entity_id, minute_floor) — the SAME accumulator the live steady-state
+        # path uses.  finalise() yields, per (entity, minute):
+        #     numeric     -> state=sum/count (mean), min, max, samples=count
+        #     non-numeric -> state=latest passthrough, samples=count
+        # so a recovered row is BYTE-IDENTICAL in shape to a live aggregated row.
+        # That routes the cloud ingestion to its single conditional put_item path
+        # (`_put_preaggregated_ts_bucket`) instead of the legacy 3-call
+        # update_item path (~2.5x DynamoDB writes), and makes re-recovery
+        # self-idempotent: the (state, samples, min, max) tuple is a deterministic
+        # function of the recorder rows, so a re-pull produces identical minute
+        # rows the cloud's more-samples-wins guard treats as a no-op.
+        #
+        # `rows_found` keeps counting GENUINE RAW in-window rows (what HA had);
+        # `rows_published` (computed below) counts the AGGREGATED minute-rows
+        # actually shipped — published <= found by construction.
+        accumulators: dict[tuple[str, str], _MinuteAccumulator] = {}
+        rows_found = 0  # GENUINE raw in-window rows (excludes boundary states)
         boundary_skipped = 0  # carried-forward include_start_time_state rows
         for entity_id, state_list in (history or {}).items():
             meta = self._entity_index.get(entity_id) or {}
@@ -422,8 +485,14 @@ class RecoveryManager:
                     ts_iso=ts_iso,
                     meta=meta,
                 )
-                if item is not None:
-                    captured.append(item)
+                if item is None:
+                    continue
+                self._fold_into_accumulator(accumulators, item)
+
+        # Finalise every accumulator → one aggregated row per (entity, minute).
+        # finalise() is the coordinator's own method, so the row shape (state /
+        # min / max / samples / brand / area / unit) matches the live path exactly.
+        captured: list[dict] = [acc.finalise() for acc in accumulators.values()]
 
         if rows_found == 0:
             # No GENUINE in-window rows — HA had nothing for the window itself

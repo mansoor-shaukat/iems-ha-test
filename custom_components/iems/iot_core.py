@@ -654,6 +654,57 @@ class IotCorePublisher:
             client_id[:8],
         )
 
+        # 2026-06-14 REGRESSION FIX — re-register every recorded subscription on
+        # the freshly-built connection.  `_build_and_connect` creates a BRAND-NEW
+        # awscrt Connection object whose native per-topic callback table is empty.
+        # awscrt's auto-reconnect REUSES its Connection object (callbacks persist
+        # + on_connection_resumed fires the resubscribe hook), but a credential-
+        # refresh reconnect (`_reconnect_with_fresh_creds`, ~hourly on STS expiry)
+        # and the publish-path reconnect both go through HERE with a NEW object and
+        # do NOT trigger on_connection_resumed — so before this call, the new
+        # connection had NO `iems/{id}/command` callback.  With clean_session=False
+        # the broker keeps the persistent-session subscription (same ClientId) and
+        # keeps DELIVERING commands (broker log: Publish-Out Success), but awscrt
+        # had no local callback for the topic → every cloud→HACS command
+        # (recover_window / take_setup_snapshot / set_shipping_mode) was silently
+        # dropped while telemetry/heartbeat (publish-only) kept flowing.  Re-issuing
+        # the subscribe here makes the command channel survive ANY connection
+        # rebuild, independent of whether an awscrt auto-resume ever fires.
+        # No-op on the initial connect (subscriptions are recorded later, by the
+        # deferred-wiring subscribe), so this never double-subscribes.
+        await self._reregister_subscriptions()
+
+    async def _reregister_subscriptions(self) -> None:
+        """Re-issue every recorded subscription against the current connection.
+
+        Called at the end of `_build_and_connect` so a freshly-built connection
+        (initial connect, credential-refresh reconnect, or publish-path
+        reconnect) carries the command-topic callback.  Distinct from
+        `resubscribe_all` (the on-resume hook): this runs on the awscrt
+        auto-resume's SIBLING path — the fresh-connection rebuild — and must NOT
+        re-enter `connect()` (we are already inside the connect path), so it
+        issues the subscribe directly via `_issue_subscribe`.  A failure is
+        logged, never raised: a resubscribe miss must not abort the connect.
+        """
+        if not self._subscriptions:
+            return
+        for topic, sub in list(self._subscriptions.items()):
+            try:
+                await self._issue_subscribe(
+                    topic=topic,
+                    qos=sub["qos"],
+                    message_handler=sub["message_handler"],
+                )
+                log.info(
+                    "iot_core: re-registered subscription on fresh connection "
+                    "topic=%s", topic,
+                )
+            except (OSError, TimeoutError, asyncio.TimeoutError) as exc:
+                log.warning(
+                    "iot_core: re-register subscribe failed topic=%s: %s: %s",
+                    topic, type(exc).__name__, exc,
+                )
+
     async def _reconnect_with_fresh_creds(self) -> None:
         """Tear down stale connection and reconnect with a fresh exchange."""
         self._connected = False

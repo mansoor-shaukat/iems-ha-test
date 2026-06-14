@@ -137,7 +137,34 @@ DOMAIN = "iems"
 # snapshot is a distinct pre-confirmation payload — NO telemetry wire-shape /
 # SCHEMA_VERSION (telemetry stays 0.6.0; snapshot stays contract const 0.13.0) /
 # chunk-cap (200) / FSM change. Only the setup-topic payload composition grows.
-VERSION = "0.5.0"
+# v0.5.1 (2026-06-14): COMMAND-SUBSCRIPTION RE-REGISTER ON REAUTH RECONNECT +
+# recovery per-minute aggregation. (1) _build_and_connect now calls
+# _reregister_subscriptions() so a freshly-BUILT awscrt connection (initial
+# connect, the ~hourly credential-refresh reconnect via _reconnect_with_fresh_creds,
+# or a publish-path reconnect) carries the iems/{id}/command callback. Root cause
+# (broker-log confirmed): a credential-refresh rebuild made a brand-new awscrt
+# Connection with an EMPTY native callback table and never re-subscribed; only
+# awscrt's auto-resume (which REUSES its Connection object + fires
+# on_connection_resumed) re-registered. With clean_session=False the broker kept
+# the persistent-session subscription and kept DELIVERING commands, but awscrt had
+# no local /command callback -> recover_window / take_setup_snapshot /
+# set_shipping_mode were silently dropped while telemetry+heartbeat (publish-only)
+# kept flowing. The re-register is a no-op on initial connect (subscriptions are
+# recorded later) so it never double-subscribes; a resubscribe miss is logged,
+# never raised, so it can't abort the connect. (2) recovery.py now folds replayed
+# recorder rows into the coordinator's _MinuteAccumulator keyed by
+# (entity_id, minute_floor) -- the SAME accumulator the live steady-state path uses
+# -- so a recovered minute-row is BYTE-IDENTICAL in shape to a live one
+# (numeric -> state=mean,min,max,samples; non-numeric -> latest passthrough). That
+# routes ingestion to the single conditional put_item path (vs the legacy ~2.5x
+# update_item path) and makes re-recovery self-idempotent. rows_found still counts
+# genuine raw in-window rows; rows_published counts the aggregated minute-rows
+# (published <= found by construction). PAYLOAD: recovery now emits FEWER rows of
+# the already-measured live shape -- per-row byte size unchanged, row count only
+# drops, so the 200-row chunk cap + 128 KiB guard headroom are unaffected. No
+# telemetry wire-shape / SCHEMA_VERSION (stays 0.6.0) / chunk-cap (200) / FSM
+# change. Patch release: bugfix + recovery write-efficiency, no contract change.
+VERSION = "0.5.1"
 
 # Config entry keys — stored in the HA config entry, never logged
 CONF_API_KEY = "api_key"
